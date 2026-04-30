@@ -22,15 +22,6 @@ This fork adds an ImGui debug overlay with renderer auto-routing, actor capture 
 
 Build outputs, generated SDK output, local IDE files, and recovery backups are intentionally ignored by git.
 
-## Support Me
-
-KoFi: https://ko-fi.com/fischsalat \
-Patreon: https://www.patreon.com/u119629245
-
-LTC (LTC-network): `LLtXWxDbc5H9d96VJF36ZpwVX6DkYGpTJU` \
-BTC (Bitcoin): `1DVDUMcotWzEG1tyd1FffyrYeu4YEh7spx` \
-USDT (Tron (TRC20)): `TWHDoUr2H52Gb2WYdZe7z1Ct316gMg64ps`
-
 ## Overriding Offsets
 
 - ### Only override any offsets if the generator doesn't find them, or if they are incorrect
