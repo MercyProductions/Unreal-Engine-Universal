@@ -302,6 +302,11 @@
     <ClCompile Include="..\imgui-master\backends\imgui_impl_opengl3.cpp" />
     <ClCompile Include="..\imgui-master\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="DebugOverlay.cpp" />
+    <ClCompile Include="RuntimeSDK\RuntimeAccess.cpp" />
+    <ClCompile Include="RuntimeSDK\RuntimeDatabase.cpp" />
+    <ClCompile Include="RuntimeSDK\RuntimeResolver.cpp" />
+    <ClCompile Include="RuntimeSDK\RuntimeSDK.cpp" />
+    <ClCompile Include="RuntimeSDK\RuntimeValidation.cpp" />
     <ClCompile Include="Engine\Private\OffsetFinder\OffsetFinder.cpp" />
     <ClCompile Include="Generator\Private\Generators\DumpspaceGenerator.cpp" />
     <ClCompile Include="Engine\Private\Unreal\NameArray.cpp" />
@@ -340,6 +345,12 @@
     <ClInclude Include="..\imgui-master\backends\imgui_impl_opengl3_loader.h" />
     <ClInclude Include="..\imgui-master\backends\imgui_impl_win32.h" />
     <ClInclude Include="DebugOverlay.h" />
+    <ClInclude Include="RuntimeSDK\RuntimeAccess.h" />
+    <ClInclude Include="RuntimeSDK\RuntimeDatabase.h" />
+    <ClInclude Include="RuntimeSDK\RuntimeResolver.h" />
+    <ClInclude Include="RuntimeSDK\RuntimeSDK.h" />
+    <ClInclude Include="RuntimeSDK\RuntimeTypes.h" />
+    <ClInclude Include="RuntimeSDK\RuntimeValidation.h" />
     <ClInclude Include="Generator\Public\Generators\DumpspaceGenerator.h" />
     <ClInclude Include="Platform\Private\Arch_x86.h" />
     <ClInclude Include="Platform\Private\PlatformWindows.h" />
