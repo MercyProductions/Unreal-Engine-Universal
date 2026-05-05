@@ -10,6 +10,7 @@
 
 #include "Generators/Generator.h"
 #include "DebugOverlay.h"
+#include "RuntimeSDK/RuntimeSDK.h"
 
 enum class EFortToastType : uint8
 {
@@ -37,6 +38,8 @@ DWORD MainThread(HMODULE Module)
 	Generator::InitEngineCore();
 	Generator::InitInternal();
 
+	const bool bRuntimeSDKReady = RuntimeSDK::Initialize();
+
 	if (Settings::Generator::GameName.empty() && Settings::Generator::GameVersion.empty())
 	{
 		// Only Possible in Main()
@@ -58,8 +61,10 @@ DWORD MainThread(HMODULE Module)
 
 	std::cerr << "FolderName: " << (Settings::Generator::GameVersion + '-' + Settings::Generator::GameName) << "\n\n";
 
-	if (DebugOverlay::Start())
+	if (bRuntimeSDKReady && DebugOverlay::Start())
 		std::cerr << "Debug overlay started. Press F4 for the ImGui menu and F7 to toggle actor drawing.\n\n";
+	else if (!bRuntimeSDKReady)
+		std::cerr << "Debug overlay not started because RuntimeSDK validation did not pass.\n\n";
 	else
 		std::cerr << "Debug overlay failed to start. The dumper will continue without ImGui.\n\n";
 
@@ -81,6 +86,7 @@ DWORD MainThread(HMODULE Module)
 		if (GetAsyncKeyState(VK_F6) & 1)
 		{
 			DebugOverlay::Shutdown();
+			RuntimeSDK::Shutdown();
 
 			fclose(stderr);
 			if (Dummy) 

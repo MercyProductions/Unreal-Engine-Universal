@@ -107,6 +107,21 @@
     <ClCompile Include="Platform\Private\PlatformWindows.cpp">
       <Filter>Platform\Private</Filter>
     </ClCompile>
+    <ClCompile Include="RuntimeSDK\RuntimeAccess.cpp">
+      <Filter>RuntimeSDK</Filter>
+    </ClCompile>
+    <ClCompile Include="RuntimeSDK\RuntimeDatabase.cpp">
+      <Filter>RuntimeSDK</Filter>
+    </ClCompile>
+    <ClCompile Include="RuntimeSDK\RuntimeResolver.cpp">
+      <Filter>RuntimeSDK</Filter>
+    </ClCompile>
+    <ClCompile Include="RuntimeSDK\RuntimeSDK.cpp">
+      <Filter>RuntimeSDK</Filter>
+    </ClCompile>
+    <ClCompile Include="RuntimeSDK\RuntimeValidation.cpp">
+      <Filter>RuntimeSDK</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="Engine">
@@ -190,10 +205,31 @@
     <Filter Include="ImGui\Backends">
       <UniqueIdentifier>{ec4a36e7-714d-45ec-bbdd-53798b60f448}</UniqueIdentifier>
     </Filter>
+    <Filter Include="RuntimeSDK">
+      <UniqueIdentifier>{58ec3ca7-3b4a-4f73-8b9a-a3a4a585b8fb}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DebugOverlay.h">
       <Filter>Overlay</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeSDK\RuntimeAccess.h">
+      <Filter>RuntimeSDK</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeSDK\RuntimeDatabase.h">
+      <Filter>RuntimeSDK</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeSDK\RuntimeResolver.h">
+      <Filter>RuntimeSDK</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeSDK\RuntimeSDK.h">
+      <Filter>RuntimeSDK</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeSDK\RuntimeTypes.h">
+      <Filter>RuntimeSDK</Filter>
+    </ClInclude>
+    <ClInclude Include="RuntimeSDK\RuntimeValidation.h">
+      <Filter>RuntimeSDK</Filter>
     </ClInclude>
     <ClInclude Include="..\imgui-master\imconfig.h">
       <Filter>ImGui</Filter>
