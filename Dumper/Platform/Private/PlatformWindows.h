@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <functional>
 #include <bit>
+#include <cstdint>
 
 #include "Settings.h"
 
@@ -127,6 +128,8 @@ namespace PlatformWindows
 	SectionInfo GetSectionInfo(const std::string& SectionName, const char* const ModuleName = Settings::General::DefaultModuleName);
 	void* IterateSectionWithCallback(const SectionInfo& Info, const std::function<bool(void* Address)>& Callback, uint32_t Granularity = 0x4, uint32_t OffsetFromEnd = 0x0);
 	void* IterateAllSectionsWithCallback(const std::function<bool(void* Address)>& Callback, uint32_t Granularity = 0x4, uint32_t OffsetFromEnd = 0x0, const char* const ModuleName = Settings::General::DefaultModuleName);
+	void* IterateSectionWithCallbackLimited(const SectionInfo& Info, const std::function<bool(void* Address)>& Callback, uint32_t Granularity = 0x4, uint32_t OffsetFromEnd = 0x0, uint64_t MaxIterations = 0, uint64_t* OutIterations = nullptr);
+	void* IterateAllSectionsWithCallbackLimited(const std::function<bool(void* Address)>& Callback, uint32_t Granularity = 0x4, uint32_t OffsetFromEnd = 0x0, uint64_t MaxIterations = 0, uint64_t* OutIterations = nullptr, const char* const ModuleName = Settings::General::DefaultModuleName);
 
 	bool IsAddressInAnyModule(const uintptr_t Address);
 	bool IsAddressInAnyModule(const void* Address);

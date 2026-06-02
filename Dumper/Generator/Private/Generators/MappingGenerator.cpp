@@ -1,19 +1,188 @@
 
 #include <iostream>
 #include <string>
+#include <system_error>
 
 #include "Generators/MappingGenerator.h"
 #include "Managers/PackageManager.h"
 #include "Compression/zstd.h"
 
+#include "OffsetFinder/Offsets.h"
+#include "Platform.h"
 #include "../Settings.h"
 #include "Utils.h"
 
+namespace
+{
+	bool IsReadableRange(const void* Address, const size_t Bytes = sizeof(void*))
+	{
+		if (!Address)
+			return false;
+
+		const uintptr_t Start = reinterpret_cast<uintptr_t>(Address);
+		const uintptr_t LastByte = Start + (Bytes > 0 ? Bytes - 1 : 0);
+
+		if (LastByte < Start)
+			return false;
+
+		return !Platform::IsBadReadPtr(reinterpret_cast<const void*>(Start))
+			&& !Platform::IsBadReadPtr(reinterpret_cast<const void*>(LastByte));
+	}
+
+	bool IsReadableAtOffset(const void* Base, const int32 Offset, const size_t Bytes = sizeof(void*))
+	{
+		if (!Base || Offset < 0)
+			return false;
+
+		const uintptr_t Address = reinterpret_cast<uintptr_t>(Base) + static_cast<uintptr_t>(Offset);
+
+		if (Address < reinterpret_cast<uintptr_t>(Base))
+			return false;
+
+		return IsReadableRange(reinterpret_cast<const void*>(Address), Bytes);
+	}
+
+	void* TryReadPointerAtOffset(const void* Base, const int32 Offset)
+	{
+		if (!IsReadableAtOffset(Base, Offset, sizeof(void*)))
+			return nullptr;
+
+		return *reinterpret_cast<void* const*>(static_cast<const uint8*>(Base) + Offset);
+	}
+
+	bool IsReadableFFieldClass(UEFFieldClass FieldClass)
+	{
+		return IsReadableAtOffset(FieldClass.GetAddress(), Off::FFieldClass::CastFlags, sizeof(EClassCastFlags));
+	}
+
+	bool IsReadableUClass(UEClass Class)
+	{
+		return IsReadableAtOffset(Class.GetAddress(), Off::UClass::CastFlags, sizeof(EClassCastFlags));
+	}
+
+	bool IsReadableUObject(UEObject Object)
+	{
+		const void* Address = Object.GetAddress();
+		const void* Class = TryReadPointerAtOffset(Address, Off::UObject::Class);
+
+		return Class && IsReadableUClass(UEClass(const_cast<void*>(Class)));
+	}
+
+	bool IsReadableProperty(UEProperty Property)
+	{
+		const void* Address = Property.GetAddress();
+
+		if (!IsReadableRange(Address))
+			return false;
+
+		const int32 ClassOffset = Settings::Internal::bUseFProperty ? Off::FField::Class : Off::UObject::Class;
+		const void* Class = TryReadPointerAtOffset(Address, ClassOffset);
+
+		if (!Class)
+			return false;
+
+		if (Settings::Internal::bUseFProperty)
+			return IsReadableFFieldClass(UEFFieldClass(const_cast<void*>(Class)));
+
+		return IsReadableUClass(UEClass(const_cast<void*>(Class)));
+	}
+
+	bool IsReadableWrapperProperty(const PropertyWrapper& Property)
+	{
+		return Property.IsUnrealProperty() && IsReadableProperty(Property.GetUnrealProperty());
+	}
+
+	UEEnum GetReadableBytePropertyEnum(UEProperty Property)
+	{
+		void* Enum = TryReadPointerAtOffset(Property.GetAddress(), Off::ByteProperty::Enum);
+		UEEnum WrappedEnum(Enum);
+
+		return IsReadableUObject(WrappedEnum) ? WrappedEnum : UEEnum(nullptr);
+	}
+
+	UEStruct GetReadableStructPropertyStruct(UEProperty Property)
+	{
+		void* Struct = TryReadPointerAtOffset(Property.GetAddress(), Off::StructProperty::Struct);
+		UEStruct WrappedStruct(Struct);
+
+		return IsReadableUObject(WrappedStruct) ? WrappedStruct : UEStruct(nullptr);
+	}
+
+	UEProperty GetReadableArrayInnerProperty(UEProperty Property)
+	{
+		UEProperty Inner(TryReadPointerAtOffset(Property.GetAddress(), Off::ArrayProperty::Inner));
+
+		return IsReadableProperty(Inner) ? Inner : UEProperty(nullptr);
+	}
+
+	UEProperty GetReadableSetElementProperty(UEProperty Property)
+	{
+		UEProperty Element(TryReadPointerAtOffset(Property.GetAddress(), Off::SetProperty::ElementProp));
+
+		return IsReadableProperty(Element) ? Element : UEProperty(nullptr);
+	}
+
+	UEProperty GetReadableOptionalValueProperty(UEProperty Property)
+	{
+		UEProperty Value(TryReadPointerAtOffset(Property.GetAddress(), Off::OptionalProperty::ValueProperty));
+
+		return IsReadableProperty(Value) ? Value : UEProperty(nullptr);
+	}
+
+	bool GetReadableMapProperties(UEProperty Property, UEProperty& OutKey, UEProperty& OutValue)
+	{
+		if (!IsReadableAtOffset(Property.GetAddress(), Off::MapProperty::Base, sizeof(Off::MapProperty::UMapPropertyBase)))
+			return false;
+
+		const auto* MapBase = reinterpret_cast<const Off::MapProperty::UMapPropertyBase*>(static_cast<const uint8*>(Property.GetAddress()) + Off::MapProperty::Base);
+
+		OutKey = UEProperty(MapBase->KeyProperty);
+		OutValue = UEProperty(MapBase->ValueProperty);
+
+		if (!IsReadableProperty(OutKey))
+			OutKey = UEProperty(nullptr);
+
+		if (!IsReadableProperty(OutValue))
+			OutValue = UEProperty(nullptr);
+
+		return OutKey || OutValue;
+	}
+
+	bool GetReadableEnumPropertyParts(UEProperty Property, UEProperty& OutUnderlayingProperty, UEEnum& OutEnum)
+	{
+		if (!IsReadableAtOffset(Property.GetAddress(), Off::EnumProperty::Base, sizeof(Off::EnumProperty::UEnumPropertyBase)))
+			return false;
+
+		const auto* EnumBase = reinterpret_cast<const Off::EnumProperty::UEnumPropertyBase*>(static_cast<const uint8*>(Property.GetAddress()) + Off::EnumProperty::Base);
+
+		OutUnderlayingProperty = UEProperty(EnumBase->UnderlayingProperty);
+		OutEnum = UEEnum(EnumBase->Enum);
+
+		if (!IsReadableProperty(OutUnderlayingProperty))
+			OutUnderlayingProperty = UEProperty(nullptr);
+
+		if (!IsReadableUObject(OutEnum))
+			OutEnum = UEEnum(nullptr);
+
+		return OutUnderlayingProperty || OutEnum;
+	}
+}
+
 EMappingsTypeFlags MappingGenerator::GetMappingType(UEProperty Property)
 {
+	if (!IsReadableProperty(Property))
+		return EMappingsTypeFlags::Unknown;
+
 	auto [Class, FieldClass] = Property.GetClass();
 
-	EClassCastFlags Flags = Class ? Class.GetCastFlags() : FieldClass.GetCastFlags();
+	EClassCastFlags Flags = EClassCastFlags::None;
+
+	if (Class && IsReadableUClass(Class))
+		Flags = Class.GetCastFlags();
+	else if (FieldClass && IsReadableFFieldClass(FieldClass))
+		Flags = FieldClass.GetCastFlags();
+	else
+		return EMappingsTypeFlags::Unknown;
 
 	if (Flags & EClassCastFlags::ByteProperty)
 	{
@@ -157,14 +326,14 @@ int32 MappingGenerator::AddNameToData(std::stringstream& NameTable, const std::s
 	{
 		static std::unordered_map<std::string, int32> NameMap;
 		
-		auto [It, bInserted] = NameMap.insert({ Name, NameCounter });
+		auto [It, bInserted] = NameMap.insert({ Name, static_cast<int32>(NameCounter) });
 
 		/* The name didn't occure yet, write it to the NameTable */
 		if (bInserted)
 		{
 			WriteToStream(NameTable, static_cast<uint16>(Name.length()));
 			NameTable.write(Name.c_str(), Name.length());
-			return NameCounter++;
+			return static_cast<int32>(NameCounter++);
 		}
 
 		return It->second;
@@ -173,12 +342,12 @@ int32 MappingGenerator::AddNameToData(std::stringstream& NameTable, const std::s
 	WriteToStream(NameTable, static_cast<uint16>(Name.length()));
 	NameTable.write(Name.c_str(), Name.length());
 
-	return NameCounter++;
+	return static_cast<int32>(NameCounter++);
 }
 
 void MappingGenerator::GeneratePropertyType(UEProperty Property, std::stringstream& Data, std::stringstream& NameTable)
 {
-	if (!Property)
+	if (!IsReadableProperty(Property))
 	{
 		WriteToStream(Data, static_cast<uint8>(EMappingsTypeFlags::Unknown));
 		return;
@@ -186,8 +355,55 @@ void MappingGenerator::GeneratePropertyType(UEProperty Property, std::stringstre
 
 	EMappingsTypeFlags MappingType = GetMappingType(Property);
 
+	if (MappingType == EMappingsTypeFlags::Unknown)
+	{
+		WriteToStream(Data, static_cast<uint8>(EMappingsTypeFlags::Unknown));
+		return;
+	}
+
 	/* Serialize ByteProperty as an EnumProperty with 'UnderlayingType == uint8' if the inner enum is valid */
-	const bool bIsFakeEnumProperty = MappingType == EMappingsTypeFlags::ByteProperty && Property.Cast<UEByteProperty>().GetEnum();
+	UEEnum BytePropertyEnum = MappingType == EMappingsTypeFlags::ByteProperty ? GetReadableBytePropertyEnum(Property) : UEEnum(nullptr);
+	const bool bIsFakeEnumProperty = MappingType == EMappingsTypeFlags::ByteProperty && BytePropertyEnum;
+
+	if (MappingType == EMappingsTypeFlags::EnumProperty)
+	{
+		UEProperty UnderlayingProperty = nullptr;
+		UEEnum Enum = nullptr;
+
+		GetReadableEnumPropertyParts(Property, UnderlayingProperty, Enum);
+
+		if (!Enum)
+		{
+			GeneratePropertyType(UnderlayingProperty, Data, NameTable);
+			return;
+		}
+
+		WriteToStream(Data, static_cast<uint8>(EMappingsTypeFlags::EnumProperty));
+		GeneratePropertyType(UnderlayingProperty, Data, NameTable);
+
+		const int32 EnumNameIdx = AddNameToData(NameTable, Enum.GetName());
+		WriteToStream(Data, EnumNameIdx);
+
+		return;
+	}
+
+	if (MappingType == EMappingsTypeFlags::StructProperty)
+	{
+		UEStruct UnderlayingStruct = GetReadableStructPropertyStruct(Property);
+
+		if (!UnderlayingStruct)
+		{
+			WriteToStream(Data, static_cast<uint8>(EMappingsTypeFlags::Unknown));
+			return;
+		}
+
+		WriteToStream(Data, static_cast<uint8>(EMappingsTypeFlags::StructProperty));
+
+		const int32 StructNameIdx = AddNameToData(NameTable, UnderlayingStruct.GetName());
+		WriteToStream(Data, StructNameIdx);
+
+		return;
+	}
 
 	WriteToStream(Data, static_cast<uint8>(!bIsFakeEnumProperty ? MappingType : EMappingsTypeFlags::EnumProperty));
 
@@ -195,65 +411,65 @@ void MappingGenerator::GeneratePropertyType(UEProperty Property, std::stringstre
 	if (bIsFakeEnumProperty)
 		WriteToStream(Data, static_cast<uint8>(EMappingsTypeFlags::ByteProperty));
 
-	if (MappingType == EMappingsTypeFlags::EnumProperty)
+	if (bIsFakeEnumProperty)
 	{
-		GeneratePropertyType(Property.Cast<UEEnumProperty>().GetUnderlayingProperty(), Data, NameTable);
-
-		const int32 EnumNameIdx = AddNameToData(NameTable, Property.Cast<UEEnumProperty>().GetEnum().GetName());
+		const int32 EnumNameIdx = AddNameToData(NameTable, BytePropertyEnum.GetName());
 		WriteToStream(Data, EnumNameIdx);
-	}
-	else if (bIsFakeEnumProperty)
-	{
-		const int32 EnumNameIdx = AddNameToData(NameTable, Property.Cast<UEByteProperty>().GetEnum().GetName());
-		WriteToStream(Data, EnumNameIdx);
-	}
-	else if (MappingType == EMappingsTypeFlags::StructProperty)
-	{
-		const int32 StructNameIdx = AddNameToData(NameTable, Property.Cast<UEStructProperty>().GetUnderlayingStruct().GetName());
-		WriteToStream(Data, StructNameIdx);
 	}
 	else if (MappingType == EMappingsTypeFlags::SetProperty)
 	{
-		GeneratePropertyType(Property.Cast<UESetProperty>().GetElementProperty(), Data, NameTable);
+		GeneratePropertyType(GetReadableSetElementProperty(Property), Data, NameTable);
 	}
 	else if (MappingType == EMappingsTypeFlags::ArrayProperty)
 	{
-		GeneratePropertyType(Property.Cast<UEArrayProperty>().GetInnerProperty(), Data, NameTable);
+		GeneratePropertyType(GetReadableArrayInnerProperty(Property), Data, NameTable);
 	}
 	else if (MappingType == EMappingsTypeFlags::OptionalProperty)
 	{
-		GeneratePropertyType(Property.Cast<UEOptionalProperty>().GetValueProperty(), Data, NameTable);
+		GeneratePropertyType(GetReadableOptionalValueProperty(Property), Data, NameTable);
 	}
 	else if (MappingType == EMappingsTypeFlags::MapProperty)
 	{
-		UEMapProperty AsMapProperty = Property.Cast<UEMapProperty>();
-		GeneratePropertyType(AsMapProperty.GetKeyProperty(), Data, NameTable);
-		GeneratePropertyType(AsMapProperty.GetValueProperty(), Data, NameTable);
+		UEProperty KeyProperty = nullptr;
+		UEProperty ValueProperty = nullptr;
+
+		GetReadableMapProperties(Property, KeyProperty, ValueProperty);
+
+		GeneratePropertyType(KeyProperty, Data, NameTable);
+		GeneratePropertyType(ValueProperty, Data, NameTable);
 	}
 }
 
 void MappingGenerator::GeneratePropertyInfo(const PropertyWrapper& Property, std::stringstream& Data, std::stringstream& NameTable, int32& Index)
 {
-	if (!Property.IsUnrealProperty())
+	if (!IsReadableWrapperProperty(Property))
 	{
-		std::cerr << "\nInvalid non-Unreal property!\n" << std::endl;
+		std::cerr << "\nInvalid or unreadable Unreal property skipped by mapping generator.\n" << std::endl;
+		return;
+	}
+
+	const int32 ArrayDim = Property.GetArrayDim();
+
+	if (ArrayDim <= 0 || ArrayDim > 0xFF)
+	{
+		std::cerr << "\nUnreal property with invalid ArrayDim skipped by mapping generator.\n" << std::endl;
 		return;
 	}
 
 	WriteToStream(Data, static_cast<uint16>(Index));
-	WriteToStream(Data, static_cast<uint8>(Property.GetArrayDim()));
+	WriteToStream(Data, static_cast<uint8>(ArrayDim));
 
 	const int32 MemberNameIdx = AddNameToData(NameTable, Property.GetUnrealProperty().GetName());
 	WriteToStream(Data, MemberNameIdx);
 
 	GeneratePropertyType(Property.GetUnrealProperty(), Data, NameTable);
 
-	Index += Property.GetArrayDim();
+	Index += ArrayDim;
 }
 
 void MappingGenerator::GenerateStruct(const StructWrapper& Struct, std::stringstream& Data, std::stringstream& NameTable)
 {
-	if (!Struct.IsValid())
+	if (!Struct.IsValid() || (Struct.IsUnrealStruct() && !IsReadableUObject(Struct.GetUnrealStruct())))
 		return;
 
 	const int32 StructNameIndex = AddNameToData(NameTable, Struct.GetRawName());
@@ -280,11 +496,19 @@ void MappingGenerator::GenerateStruct(const StructWrapper& Struct, std::stringst
 
 	for (const PropertyWrapper& Member : Members.IterateMembers())
 	{
+		if (!IsReadableWrapperProperty(Member))
+			continue;
+
 		if (ExcludeEditorOnlyProps && Member.HasPropertyFlags(EPropertyFlags::EditorOnly))
 			continue;
 
+		const int32 ArrayDim = Member.GetArrayDim();
+
+		if (ArrayDim <= 0 || ArrayDim > 0xFF)
+			continue;
+
 		SerializablePropertyCount++;
-		PropertyCount += Member.GetArrayDim();
+		PropertyCount += ArrayDim;
 	}
 
 	/* uint16, uint16 */
@@ -296,6 +520,9 @@ void MappingGenerator::GenerateStruct(const StructWrapper& Struct, std::stringst
 
 	for (const PropertyWrapper& Member : Members.IterateMembers())
 	{
+		if (!IsReadableWrapperProperty(Member))
+			continue;
+
 		if (ExcludeEditorOnlyProps && Member.HasPropertyFlags(EPropertyFlags::EditorOnly))
 			continue;
 
@@ -305,6 +532,9 @@ void MappingGenerator::GenerateStruct(const StructWrapper& Struct, std::stringst
 
 void MappingGenerator::GenerateEnum(const EnumWrapper& Enum, std::stringstream& Data, std::stringstream& NameTable)
 {
+	if (!Enum.IsValid() || !IsReadableUObject(Enum.GetUnrealEnum()))
+		return;
+
 	const int32 EnumNameIndex = AddNameToData(NameTable, Enum.GetRawName());
 	WriteToStream(Data, EnumNameIndex);
 
@@ -339,7 +569,12 @@ std::stringstream MappingGenerator::GenerateFileData()
 
 		for (int32 EnumIdx : Package.GetEnums())
 		{
-			GenerateEnum(ObjectArray::GetByIndex<UEEnum>(EnumIdx), EnumData, NameData);
+			UEEnum Enum = ObjectArray::GetByIndex<UEEnum>(EnumIdx);
+
+			if (!IsReadableUObject(Enum))
+				continue;
+
+			GenerateEnum(EnumWrapper(Enum), EnumData, NameData);
 			NumEnums++;
 		}
 	}
@@ -356,7 +591,12 @@ std::stringstream MappingGenerator::GenerateFileData()
 
 		DependencyManager::OnVisitCallbackType GenerateStructCallback = [&](int32 Index) -> void
 		{
-			GenerateStruct(ObjectArray::GetByIndex<UEStruct>(Index), StructData, NameData);
+			UEStruct Struct = ObjectArray::GetByIndex<UEStruct>(Index);
+
+			if (!IsReadableUObject(Struct))
+				return;
+
+			GenerateStruct(StructWrapper(Struct), StructData, NameData);
 			NumStructsAndClasse++;
 		};
 
@@ -462,12 +702,43 @@ void MappingGenerator::Generate()
 	FileNameHelper::MakeValidFileName(MappingsFileName);
 
 	/* Open the stream as binary data, else ofstream will add \r after numbers that can be interpreted as \n. */
-	std::ofstream UsmapFile(MainFolder / MappingsFileName, std::ios::binary);
+	const fs::path MappingsFilePath = MainFolder / MappingsFileName;
+	fs::path TempMappingsFilePath = MappingsFilePath;
+	TempMappingsFilePath += ".tmp";
+
+	std::ofstream UsmapFile(TempMappingsFilePath, std::ios::binary);
+
+	if (!UsmapFile)
+	{
+		std::cerr << std::format("MappingGeneration: failed to open '{}' for writing.\n", TempMappingsFilePath.string());
+		return;
+	}
 
 	/* Generate the payload of the file, containing all of the names, enums and structs. */
 	std::stringstream FileData = GenerateFileData();
 
 	/* Generate the header, and write both header and payload into the file. */
 	GenerateFileHeader(UsmapFile, FileData);
-}
 
+	UsmapFile.close();
+
+	if (!UsmapFile.good())
+	{
+		std::cerr << std::format("MappingGeneration: failed while writing '{}'.\n", TempMappingsFilePath.string());
+		return;
+	}
+
+	std::error_code FileError;
+	fs::rename(TempMappingsFilePath, MappingsFilePath, FileError);
+
+	if (FileError)
+	{
+		FileError.clear();
+		fs::remove(MappingsFilePath, FileError);
+		FileError.clear();
+		fs::rename(TempMappingsFilePath, MappingsFilePath, FileError);
+	}
+
+	if (FileError)
+		std::cerr << std::format("MappingGeneration: failed to publish '{}': {}\n", MappingsFilePath.string(), FileError.message());
+}

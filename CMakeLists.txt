@@ -100,3 +100,26 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     WINDOWS_EXPORT_ALL_SYMBOLS ON
     VS_GLOBAL_KEYWORD "Win32Proj"
 ) 
+
+add_executable(UnrealCrashInspector
+    "CrashInspector/main.cpp"
+)
+
+target_compile_features(UnrealCrashInspector PRIVATE cxx_std_20)
+
+target_compile_definitions(UnrealCrashInspector PRIVATE
+    _CONSOLE
+    UNICODE
+    _UNICODE
+    WIN32
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
+target_link_libraries(UnrealCrashInspector PRIVATE shell32)
+
+if(MSVC)
+    target_compile_options(UnrealCrashInspector PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(UnrealCrashInspector PRIVATE -Wall -Wextra -Wpedantic)
+endif()

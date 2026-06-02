@@ -1,5 +1,6 @@
 #include <vector>
 #include <array>
+#include <exception>
 
 #include "Unreal/ObjectArray.h"
 #include "Generators/CppGenerator.h"
@@ -1198,16 +1199,38 @@ std::unordered_map<std::string, UEProperty> CppGenerator::GetUnknownProperties()
 
 	for (UEObject Obj : ObjectArray())
 	{
-		if (!Obj.IsA(EClassCastFlags::Struct))
-			continue;
-
-		for (UEProperty Prop : Obj.Cast<UEStruct>().GetProperties())
+		try
 		{
-			bool bIsUnknownProperty = false;
-			const std::string TypeName = GetMemberTypeStringWithoutConst(Prop, -1, &bIsUnknownProperty);
+			if (!Obj.IsA(EClassCastFlags::Struct))
+				continue;
 
-			if (bIsUnknownProperty)
-				PropertiesWithNames[TypeName] = Prop;
+			for (UEProperty Prop : Obj.Cast<UEStruct>().GetProperties())
+			{
+				try
+				{
+					bool bIsUnknownProperty = false;
+					const std::string TypeName = GetMemberTypeStringWithoutConst(Prop, -1, &bIsUnknownProperty);
+
+					if (bIsUnknownProperty && !TypeName.empty())
+						PropertiesWithNames[TypeName] = Prop;
+				}
+				catch (const std::exception& Exception)
+				{
+					std::cerr << "Skipping unknown property fixup entry: " << Exception.what() << "\n";
+				}
+				catch (...)
+				{
+					std::cerr << "Skipping unknown property fixup entry: unknown exception\n";
+				}
+			}
+		}
+		catch (const std::exception& Exception)
+		{
+			std::cerr << "Skipping object during unknown property discovery: " << Exception.what() << "\n";
+		}
+		catch (...)
+		{
+			std::cerr << "Skipping object during unknown property discovery: unknown exception\n";
 		}
 	}
 
@@ -1217,15 +1240,48 @@ std::unordered_map<std::string, UEProperty> CppGenerator::GetUnknownProperties()
 void CppGenerator::GeneratePropertyFixupFile(StreamType& PropertyFixup)
 {
 	WriteFileHead(PropertyFixup, nullptr, EFileType::PropertyFixup, "PROPERTY-FIXUP");
+	PropertyFixup.flush();
 
-	std::unordered_map<std::string, UEProperty> UnknownProperties = GetUnknownProperties();
+	std::unordered_map<std::string, UEProperty> UnknownProperties;
+	try
+	{
+		UnknownProperties = GetUnknownProperties();
+	}
+	catch (const std::exception& Exception)
+	{
+		std::cerr << "Property fixup discovery failed: " << Exception.what() << "\n";
+	}
+	catch (...)
+	{
+		std::cerr << "Property fixup discovery failed: unknown exception\n";
+	}
 
 	for (const auto& [Name, Property] : UnknownProperties)
 	{
-		PropertyFixup << std::format("\nclass alignas(0x{:02X}) {}\n{{\n\tunsigned __int8 Pad[0x{:X}];\n}};\n",Property.GetAlignment(), Name, Property.GetSize());
+		try
+		{
+			const int32 Alignment = Property.GetAlignment();
+			const int32 Size = Property.GetSize();
+			if (Name.empty() || Alignment <= 0 || Alignment > 0x1000 || Size <= 0 || Size > 0x100000)
+			{
+				std::cerr << "Skipping invalid property fixup entry: " << Name << "\n";
+				continue;
+			}
+
+			PropertyFixup << std::format("\nclass alignas(0x{:02X}) {}\n{{\n\tunsigned __int8 Pad[0x{:X}];\n}};\n", Alignment, Name, Size);
+		}
+		catch (const std::exception& Exception)
+		{
+			std::cerr << "Skipping property fixup entry \"" << Name << "\": " << Exception.what() << "\n";
+		}
+		catch (...)
+		{
+			std::cerr << "Skipping property fixup entry \"" << Name << "\": unknown exception\n";
+		}
 	}
 
 	WriteFileEnd(PropertyFixup, EFileType::PropertyFixup);
+	PropertyFixup.flush();
 }
 
 void CppGenerator::GenerateEnumFwdDeclarations(StreamType& ClassOrStructFile, PackageInfoHandle Package, bool bIsClassFile)

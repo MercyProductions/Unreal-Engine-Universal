@@ -20,6 +20,32 @@ This fork adds an ImGui debug overlay with renderer auto-routing, actor capture 
 - Category filters: player-like, bot, NPC, civilian, AI, camera, item, weapon, vehicle, objective, environment, and local player
 - Developer tab: kept/filtered actor tables, class browser, auto-cycle class filter, selected actor details, and reflected class fields/methods
 
+## Unreal Crash Inspector
+
+This workspace also includes `UnrealCrashInspector`, an external companion executable for diagnosing games that close with a generic Unreal fatal error dialog.
+
+- Scans `Saved\Logs`, `Saved\Crashes`, `diagnostics.txt`, and `CrashContext.runtime-xml`
+- Pulls the fatal line plus the important log context around it
+- Classifies common causes such as GPU device loss, access violations, assertions, missing assets, plugin/module failures, Blueprint runaway loops, and memory exhaustion
+- Writes a clear text report under `CrashReports`
+
+Build only the companion app with:
+
+```bat
+cmake --preset vs2022
+cmake --build --preset vs2022-Release --target UnrealCrashInspector
+```
+
+Run examples:
+
+```bat
+UnrealCrashInspector.exe --game MyGame
+UnrealCrashInspector.exe --path "%LOCALAPPDATA%\MyGame\Saved\Crashes"
+UnrealCrashInspector.exe --watch --game MyGame
+```
+
+See [CrashInspector/README.md](CrashInspector/README.md) for the full usage notes.
+
 Build outputs, generated SDK output, local IDE files, and recovery backups are intentionally ignored by git.
 
 ## Overriding Offsets

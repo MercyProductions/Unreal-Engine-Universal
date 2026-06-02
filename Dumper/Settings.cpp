@@ -202,6 +202,31 @@ void Settings::Config::Load()
 			std::cerr << "Press " << KeyName << " to begin dump." << "\n";
 		}
 	}
+
+	GenerateMappings = GetPrivateProfileIntA("Settings", "GenerateMappings", GenerateMappings ? 1 : 0, ConfigPath) != 0;
+	GenerateIDAMappings = GetPrivateProfileIntA("Settings", "GenerateIDAMappings", GenerateIDAMappings ? 1 : 0, ConfigPath) != 0;
+	GenerateDumpspace = GetPrivateProfileIntA("Settings", "GenerateDumpspace", GenerateDumpspace ? 1 : 0, ConfigPath) != 0;
+	StartDebugOverlay = GetPrivateProfileIntA("Settings", "StartDebugOverlay", StartDebugOverlay ? 1 : 0, ConfigPath) != 0;
+	AutoUnloadAfterGeneration = GetPrivateProfileIntA("Settings", "AutoUnloadAfterGeneration", AutoUnloadAfterGeneration ? 1 : 0, ConfigPath) != 0;
+	BeepWhenGenerationFinished = GetPrivateProfileIntA("Settings", "BeepWhenGenerationFinished", BeepWhenGenerationFinished ? 1 : 0, ConfigPath) != 0;
+
+	if (GenerateMappings)
+		std::cerr << "Optional mapping generation enabled.\n";
+
+	if (GenerateIDAMappings)
+		std::cerr << "Optional IDA mapping generation enabled.\n";
+
+	if (GenerateDumpspace)
+		std::cerr << "Optional dumpspace generation enabled.\n";
+
+	if (!StartDebugOverlay)
+		std::cerr << "Debug overlay disabled by config.\n";
+
+	if (AutoUnloadAfterGeneration)
+		std::cerr << "Auto-unload after generation enabled.\n";
+
+	if (BeepWhenGenerationFinished)
+		std::cerr << "Generation-finished beep enabled.\n";
 }
 
 void Settings::Config::DelayDumperStart()

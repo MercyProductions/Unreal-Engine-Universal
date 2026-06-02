@@ -22,6 +22,12 @@ namespace Settings
 		inline int SleepTimeout = 0;
 		inline int DumpKey = 0;
 		inline std::string SDKNamespaceName = "SDK";
+		inline bool GenerateMappings = false;
+		inline bool GenerateIDAMappings = false;
+		inline bool GenerateDumpspace = false;
+		inline bool StartDebugOverlay = true;
+		inline bool AutoUnloadAfterGeneration = false;
+		inline bool BeepWhenGenerationFinished = true;
 
 		void Load();
 		void DelayDumperStart();

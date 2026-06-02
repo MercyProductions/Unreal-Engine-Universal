@@ -18,6 +18,7 @@ private:
 
 	friend bool IsAddressValidGObjects(const uintptr_t, const struct FFixedUObjectArrayLayout&);
 	friend bool IsAddressValidGObjects(const uintptr_t, const struct FChunkedFixedUObjectArrayLayout&);
+	friend bool IsAddressValidGObjects(const uintptr_t, const struct FLegacyTArrayUObjectLayout&);
 
 private:
 	static inline uint8* GObjects = nullptr;
@@ -43,6 +44,7 @@ public:
 
 	static void Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& ObjectArrayLayout = FFixedUObjectArrayLayout(), const char* const ModuleName = Settings::General::DefaultModuleName);
 	static void Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChunkedFixedUObjectArrayLayout& ObjectArrayLayout = FChunkedFixedUObjectArrayLayout(), const char* const ModuleName = Settings::General::DefaultModuleName);
+	static void Init(int32 GObjectsOffset, const FLegacyTArrayUObjectLayout& ObjectArrayLayout, const char* const ModuleName = Settings::General::DefaultModuleName);
 
 	static void DumpObjects(const fs::path& Path, bool bWithPathname = false);
 	static void DumpObjectsWithProperties(const fs::path& Path, bool bWithPathname = false);

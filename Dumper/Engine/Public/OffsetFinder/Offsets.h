@@ -29,6 +29,18 @@ struct FChunkedFixedUObjectArrayLayout
 	}
 };
 
+struct FLegacyTArrayUObjectLayout
+{
+	int32 ObjectsOffset = -1;
+	int32 NumObjectsOffset = -1;
+	int32 MaxObjectsOffset = -1;
+
+	inline bool IsValid() const
+	{
+		return ObjectsOffset != -1 && NumObjectsOffset != -1 && MaxObjectsOffset != -1;
+	}
+};
+
 namespace Off
 {
 	void Init();
@@ -108,14 +120,16 @@ namespace Off
 	{
 		inline FFixedUObjectArrayLayout FixedLayout;
 		inline FChunkedFixedUObjectArrayLayout ChunkedFixedLayout;
+		inline FLegacyTArrayUObjectLayout LegacyTArrayLayout;
 
 		inline bool bIsChunked = false;
+		inline bool bIsLegacyTArray = false;
 
-		inline int32 GetObjectsOffset() { return  bIsChunked ? ChunkedFixedLayout.ObjectsOffset : FixedLayout.ObjectsOffset; }
-		inline int32 GetNumElementsOffset() { return  bIsChunked ? ChunkedFixedLayout.NumElementsOffset : FixedLayout.NumObjectsOffset; }
-		inline int32 GetMaxElementsOffset() { return  bIsChunked ? ChunkedFixedLayout.MaxElementsOffset : FixedLayout.MaxObjectsOffset; }
-		inline int32 GetNumChunksOffset() { return  bIsChunked ? ChunkedFixedLayout.NumChunksOffset : 0x0; }
-		inline int32 GetMaxChunksOffset() { return  bIsChunked ? ChunkedFixedLayout.MaxChunksOffset : 0x0; }
+		inline int32 GetObjectsOffset() { return bIsLegacyTArray ? LegacyTArrayLayout.ObjectsOffset : (bIsChunked ? ChunkedFixedLayout.ObjectsOffset : FixedLayout.ObjectsOffset); }
+		inline int32 GetNumElementsOffset() { return bIsLegacyTArray ? LegacyTArrayLayout.NumObjectsOffset : (bIsChunked ? ChunkedFixedLayout.NumElementsOffset : FixedLayout.NumObjectsOffset); }
+		inline int32 GetMaxElementsOffset() { return bIsLegacyTArray ? LegacyTArrayLayout.MaxObjectsOffset : (bIsChunked ? ChunkedFixedLayout.MaxElementsOffset : FixedLayout.MaxObjectsOffset); }
+		inline int32 GetNumChunksOffset() { return bIsLegacyTArray ? -1 : (bIsChunked ? ChunkedFixedLayout.NumChunksOffset : 0x0); }
+		inline int32 GetMaxChunksOffset() { return bIsLegacyTArray ? -1 : (bIsChunked ? ChunkedFixedLayout.MaxChunksOffset : 0x0); }
 	}
 
 	namespace NameArray

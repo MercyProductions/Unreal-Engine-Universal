@@ -3,6 +3,8 @@
 #include <fstream>
 #include <format>
 #include <filesystem>
+#include <algorithm>
+#include <cstdint>
 
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
@@ -13,6 +15,26 @@
 
 namespace fs = std::filesystem;
 
+namespace
+{
+	template<typename T>
+	bool TryReadObjectArrayValue(const void* Address, T& OutValue)
+	{
+		if (!Address || Platform::IsBadReadPtr(Address))
+			return false;
+
+		__try
+		{
+			OutValue = *reinterpret_cast<const T*>(Address);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+}
+
 constexpr inline std::array FFixedUObjectArrayLayouts =
 {
 	FFixedUObjectArrayLayout // Default UE4.11 - UE4.20
@@ -20,6 +42,16 @@ constexpr inline std::array FFixedUObjectArrayLayouts =
 		.ObjectsOffset = 0x0,								// 0x00
 		.MaxObjectsOffset = sizeof(void*),					// 0x08 (64bit) OR 0x04 (32bit)
 		.NumObjectsOffset = sizeof(void*) + sizeof(int)		// 0x0C (64bit) OR 0x08 (32bit)
+	}
+};
+
+constexpr inline std::array FLegacyTArrayUObjectLayouts =
+{
+	FLegacyTArrayUObjectLayout // UE1/UE2/UE3 style TArray<UObject*>
+	{
+		.ObjectsOffset = 0x0,
+		.NumObjectsOffset = sizeof(void*),
+		.MaxObjectsOffset = sizeof(void*) + sizeof(int32)
 	}
 };
 
@@ -68,9 +100,15 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FFixedUObjectArrayLay
 		uint8_t Pad[sizeof(void*) * 2];
 	};
 
-	void* Objects = *reinterpret_cast<void**>(Address + Layout.ObjectsOffset);
-	const int32 MaxElements = *reinterpret_cast<const int32*>(Address + Layout.MaxObjectsOffset);
-	const int32 NumElements = *reinterpret_cast<const int32*>(Address + Layout.NumObjectsOffset);
+	void* Objects = nullptr;
+	int32 MaxElements = 0;
+	int32 NumElements = 0;
+	if (!TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.ObjectsOffset), Objects)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.MaxObjectsOffset), MaxElements)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.NumObjectsOffset), NumElements))
+	{
+		return false;
+	}
 
 	FUObjectItem* ObjectsButDecrypted = reinterpret_cast<FUObjectItem*>(ObjectArray::DecryptPtr(Objects));
 
@@ -86,11 +124,17 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FFixedUObjectArrayLay
 	if (Platform::IsBadReadPtr(ObjectsButDecrypted))
 		return false;
 
-	if (Platform::IsBadReadPtr(ObjectsButDecrypted[5].Object))
+	FUObjectItem FifthItem{};
+	if (!TryReadObjectArrayValue(&ObjectsButDecrypted[0x5], FifthItem)
+		|| Platform::IsBadReadPtr(FifthItem.Object))
+	{
 		return false;
+	}
 
-	const uintptr_t FifthObject = reinterpret_cast<uintptr_t>(ObjectsButDecrypted[0x5].Object);
-	const int32 IndexOfFithobject = *reinterpret_cast<int32_t*>(FifthObject + sizeof(void*) + sizeof(int32)); // FifthObject -> InternalIndex
+	const uintptr_t FifthObject = reinterpret_cast<uintptr_t>(FifthItem.Object);
+	int32 IndexOfFithobject = -1;
+	if (!TryReadObjectArrayValue(reinterpret_cast<const void*>(FifthObject + sizeof(void*) + sizeof(int32)), IndexOfFithobject)) // FifthObject -> InternalIndex
+		return false;
 
 	if (IndexOfFithobject != 0x5)
 		return false;
@@ -98,13 +142,97 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FFixedUObjectArrayLay
 	return true;
 }
 
+bool IsAddressValidGObjects(const uintptr_t Address, const FLegacyTArrayUObjectLayout& Layout)
+{
+	void* Objects = nullptr;
+	int32 NumElements = 0;
+	int32 MaxElements = 0;
+	if (!TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.ObjectsOffset), Objects)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.NumObjectsOffset), NumElements)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.MaxObjectsOffset), MaxElements))
+	{
+		return false;
+	}
+
+	uint8_t* ObjectsButDecrypted = ObjectArray::DecryptPtr(Objects);
+
+	if (!ObjectsButDecrypted || Platform::IsBadReadPtr(ObjectsButDecrypted))
+		return false;
+
+	if (NumElements <= 0x100 || NumElements > MaxElements)
+		return false;
+
+	if (MaxElements > 0x400000)
+		return false;
+
+	int32 ValidObjects = 0;
+	int32 MatchedIndexOffsets[0x81 / sizeof(int32)]{};
+	const int32 SampleSpan = NumElements < 0x400 ? NumElements : 0x400;
+	const int32 SampleStep = SampleSpan > 0x80 ? 0x8 : 0x1;
+
+	for (int32 Index = 0; Index < SampleSpan && ValidObjects < 32; Index += SampleStep)
+	{
+		if (Index < 0 || Index >= NumElements)
+			continue;
+
+		void* Object = nullptr;
+		if (!TryReadObjectArrayValue(reinterpret_cast<void**>(ObjectsButDecrypted) + Index, Object)
+			|| !Object
+			|| Platform::IsBadReadPtr(Object))
+		{
+			continue;
+		}
+
+		void* Vft = nullptr;
+		if (!TryReadObjectArrayValue(Object, Vft) || !Vft || Platform::IsBadReadPtr(Vft))
+			continue;
+
+		if (!Platform::IsAddressInProcessRange(Vft))
+			continue;
+
+		ValidObjects++;
+
+		for (int32 Offset = sizeof(int32); Offset <= 0x80; Offset += sizeof(int32))
+		{
+			int32 PossibleIndex = -1;
+			if (!TryReadObjectArrayValue(reinterpret_cast<const uint8_t*>(Object) + Offset, PossibleIndex))
+				continue;
+
+			if (PossibleIndex == Index)
+			{
+				MatchedIndexOffsets[Offset / sizeof(int32)]++;
+				break;
+			}
+		}
+	}
+
+	if (ValidObjects < 3)
+		return false;
+
+	for (const int32 MatchCount : MatchedIndexOffsets)
+	{
+		if (MatchCount >= 2)
+			return true;
+	}
+
+	return ValidObjects >= 8;
+}
+
 bool IsAddressValidGObjects(const uintptr_t Address, const FChunkedFixedUObjectArrayLayout& Layout)
 {
-	void* Objects = *reinterpret_cast<void**>(Address + Layout.ObjectsOffset);
-	const int32 MaxElements = *reinterpret_cast<const int32*>(Address + Layout.MaxElementsOffset);
-	const int32 NumElements = *reinterpret_cast<const int32*>(Address + Layout.NumElementsOffset);
-	const int32 MaxChunks   = *reinterpret_cast<const int32*>(Address + Layout.MaxChunksOffset);
-	const int32 NumChunks   = *reinterpret_cast<const int32*>(Address + Layout.NumChunksOffset);
+	void* Objects = nullptr;
+	int32 MaxElements = 0;
+	int32 NumElements = 0;
+	int32 MaxChunks = 0;
+	int32 NumChunks = 0;
+	if (!TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.ObjectsOffset), Objects)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.MaxElementsOffset), MaxElements)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.NumElementsOffset), NumElements)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.MaxChunksOffset), MaxChunks)
+		|| !TryReadObjectArrayValue(reinterpret_cast<const void*>(Address + Layout.NumChunksOffset), NumChunks))
+	{
+		return false;
+	}
 
 	void** ObjectsPtrButDecrypted = reinterpret_cast<void**>(ObjectArray::DecryptPtr(Objects));
 
@@ -146,8 +274,13 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FChunkedFixedUObjectA
 
 	for (int i = 0; i < NumChunks; i++)
 	{
-		if (!ObjectsPtrButDecrypted[i] || Platform::IsBadReadPtr(ObjectsPtrButDecrypted[i]))
+		void* Chunk = nullptr;
+		if (!TryReadObjectArrayValue(&ObjectsPtrButDecrypted[i], Chunk)
+			|| !Chunk
+			|| Platform::IsBadReadPtr(Chunk))
+		{
 			return false;
+		}
 	}
 
 	return true;
@@ -156,9 +289,13 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FChunkedFixedUObjectA
 
 void ObjectArray::InitializeFUObjectItem(uint8_t* FirstItemPtr)
 {
+	if (!FirstItemPtr || Platform::IsBadReadPtr(FirstItemPtr))
+		return;
+
 	for (int i = 0x0; i < 0x20; i += 4)
 	{
-		if (!Platform::IsBadReadPtr(*reinterpret_cast<uint8_t**>(FirstItemPtr + i)))
+		uint8_t* Candidate = nullptr;
+		if (TryReadObjectArrayValue(FirstItemPtr + i, Candidate) && !Platform::IsBadReadPtr(Candidate))
 		{
 			FUObjectItemInitialOffset = i;
 			break;
@@ -167,11 +304,22 @@ void ObjectArray::InitializeFUObjectItem(uint8_t* FirstItemPtr)
 
 	for (int i = FUObjectItemInitialOffset + sizeof(void*); i <= 0x38; i += 4)
 	{
-		void* SecondObject = *reinterpret_cast<uint8**>(FirstItemPtr + i);
-		void* ThirdObject  = *reinterpret_cast<uint8**>(FirstItemPtr + (i * 2) - FUObjectItemInitialOffset);
+		void* SecondObject = nullptr;
+		void* ThirdObject = nullptr;
+		if (!TryReadObjectArrayValue(FirstItemPtr + i, SecondObject)
+			|| !TryReadObjectArrayValue(FirstItemPtr + (i * 2) - FUObjectItemInitialOffset, ThirdObject))
+		{
+			continue;
+		}
 
-		if (!Platform::IsBadReadPtr(SecondObject) && !Platform::IsBadReadPtr(*reinterpret_cast<void**>(SecondObject)) &&
-			!Platform::IsBadReadPtr(ThirdObject) && !Platform::IsBadReadPtr(*reinterpret_cast<void**>(ThirdObject)))
+		void* SecondVft = nullptr;
+		void* ThirdVft = nullptr;
+		if (!Platform::IsBadReadPtr(SecondObject)
+			&& TryReadObjectArrayValue(SecondObject, SecondVft)
+			&& !Platform::IsBadReadPtr(SecondVft)
+			&& !Platform::IsBadReadPtr(ThirdObject)
+			&& TryReadObjectArrayValue(ThirdObject, ThirdVft)
+			&& !Platform::IsBadReadPtr(ThirdVft))
 		{
 			SizeOfFUObjectItem = i - FUObjectItemInitialOffset;
 			break;
@@ -210,12 +358,20 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 			if constexpr (std::is_same_v<ArrayLayoutType, FFixedUObjectArrayLayout>)
 			{
 				Off::FUObjectArray::bIsChunked = false;
+				Off::FUObjectArray::bIsLegacyTArray = false;
 				Off::FUObjectArray::FixedLayout = Layout;
 			}
-			else
+			else if constexpr (std::is_same_v<ArrayLayoutType, FChunkedFixedUObjectArrayLayout>)
 			{
 				Off::FUObjectArray::bIsChunked = true;
+				Off::FUObjectArray::bIsLegacyTArray = false;
 				Off::FUObjectArray::ChunkedFixedLayout = Layout;
+			}
+			else if constexpr (std::is_same_v<ArrayLayoutType, FLegacyTArrayUObjectLayout>)
+			{
+				Off::FUObjectArray::bIsChunked = false;
+				Off::FUObjectArray::bIsLegacyTArray = true;
+				Off::FUObjectArray::LegacyTArrayLayout = Layout;
 			}
 
 			return true;
@@ -224,18 +380,37 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 		return false;
 	};
 
-	bool bIsGObjectsChunked = false;
-	auto IsAddressValidGObjects = [MatchesAnyLayout, &bIsGObjectsChunked](const void* CurrentAddress) -> bool
+	enum class EObjectArrayKind
+	{
+		None,
+		Fixed,
+		Chunked,
+		LegacyTArray
+	};
+
+	EObjectArrayKind ObjectArrayKind = EObjectArrayKind::None;
+	auto IsAddressValidModernGObjects = [MatchesAnyLayout, &ObjectArrayKind](const void* CurrentAddress) -> bool
 	{
 		//std::cerr << "checking addr: " << CurrentAddress << "\n";
 		if (MatchesAnyLayout(FFixedUObjectArrayLayouts, reinterpret_cast<uintptr_t>(CurrentAddress)))
 		{
-			bIsGObjectsChunked = false;
+			ObjectArrayKind = EObjectArrayKind::Fixed;
 			return true;
 		}
 		else if (MatchesAnyLayout(FChunkedFixedUObjectArrayLayouts, reinterpret_cast<uintptr_t>(CurrentAddress)))
 		{
-			bIsGObjectsChunked = true;
+			ObjectArrayKind = EObjectArrayKind::Chunked;
+			return true;
+		}
+
+		return false;
+	};
+
+	auto IsAddressValidLegacyGObjects = [MatchesAnyLayout, &ObjectArrayKind](const void* CurrentAddress) -> bool
+	{
+		if (MatchesAnyLayout(FLegacyTArrayUObjectLayouts, reinterpret_cast<uintptr_t>(CurrentAddress)))
+		{
+			ObjectArrayKind = EObjectArrayKind::LegacyTArray;
 			return true;
 		}
 
@@ -243,20 +418,60 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 	};
 
 	void* GObjectsAddress = nullptr;
+	constexpr uint64_t FastSectionScanLimit = 0x800000; // 32 MiB at 4-byte granularity
+	constexpr uint64_t SecondarySectionScanLimit = 0x400000; // 16 MiB at 4-byte granularity
+	constexpr uint64_t BoundedAllSectionScanLimit = 0x1800000; // 96 MiB at 4-byte granularity
+
+	auto ScanNamedSection = [&](const char* SectionName, uint64_t MaxIterations, const std::function<bool(void* Address)>& Callback, const char* PassName) -> void*
+	{
+		uint64_t Iterations = 0;
+		std::cerr << "[ObjectArray] Scanning " << SectionName << " for " << PassName << " GObjects";
+		if (MaxIterations != 0)
+			std::cerr << " (bounded)";
+		std::cerr << "...\n";
+
+		void* Result = Platform::IterateSectionWithCallbackLimited(Platform::GetSectionInfo(SectionName, ModuleName), Callback, 0x4, 0x50, MaxIterations, &Iterations);
+		if (!Result)
+			std::cerr << "[ObjectArray] " << SectionName << " scan checked 0x" << std::hex << Iterations << std::dec << " candidates\n";
+
+		return Result;
+	};
 
 	if (bScanAllMemory)
 	{
-		GObjectsAddress = Platform::IterateAllSectionsWithCallback(IsAddressValidGObjects, 0x4, 0x50, ModuleName);
+		uint64_t Iterations = 0;
+		std::cerr << "[ObjectArray] Running bounded all-section modern GObjects scan...\n";
+		GObjectsAddress = Platform::IterateAllSectionsWithCallbackLimited(IsAddressValidModernGObjects, 0x4, 0x50, BoundedAllSectionScanLimit, &Iterations, ModuleName);
+		if (!GObjectsAddress)
+		{
+			std::cerr << "[ObjectArray] Modern all-section scan checked 0x" << std::hex << Iterations << std::dec << " candidates\n";
+			Iterations = 0;
+			std::cerr << "[ObjectArray] Running bounded all-section legacy GObjects scan...\n";
+			GObjectsAddress = Platform::IterateAllSectionsWithCallbackLimited(IsAddressValidLegacyGObjects, 0x4, 0x50, BoundedAllSectionScanLimit, &Iterations, ModuleName);
+		}
+		if (!GObjectsAddress)
+			std::cerr << "[ObjectArray] Bounded all-section scan checked 0x" << std::hex << Iterations << std::dec << " candidates\n";
 	}
 	else
 	{
-		GObjectsAddress = Platform::IterateSectionWithCallback(Platform::GetSectionInfo(".data"), IsAddressValidGObjects, 0x4, 0x50);
+		GObjectsAddress = ScanNamedSection(".data", FastSectionScanLimit, IsAddressValidModernGObjects, "modern");
+		if (!GObjectsAddress)
+			GObjectsAddress = ScanNamedSection(".rdata", SecondarySectionScanLimit, IsAddressValidModernGObjects, "modern");
+		if (!GObjectsAddress)
+			GObjectsAddress = ScanNamedSection(".bss", SecondarySectionScanLimit, IsAddressValidModernGObjects, "modern");
+
+		if (!GObjectsAddress)
+			GObjectsAddress = ScanNamedSection(".data", FastSectionScanLimit, IsAddressValidLegacyGObjects, "legacy");
+		if (!GObjectsAddress)
+			GObjectsAddress = ScanNamedSection(".rdata", SecondarySectionScanLimit, IsAddressValidLegacyGObjects, "legacy");
+		if (!GObjectsAddress)
+			GObjectsAddress = ScanNamedSection(".bss", SecondarySectionScanLimit, IsAddressValidLegacyGObjects, "legacy");
 	}
 
 
 	if (GObjectsAddress)
 	{
-		if (!bIsGObjectsChunked)
+		if (ObjectArrayKind == EObjectArrayKind::Fixed)
 		{
 			GObjects = static_cast<uint8*>(GObjectsAddress);
 			NumElementsPerChunk = -1;
@@ -267,23 +482,77 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= Num())
 					return nullptr;
 
-				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
+				uint8_t* Objects = nullptr;
+				if (!TryReadObjectArrayValue(ObjectsArray, Objects))
+					return nullptr;
 
-				return *reinterpret_cast<void**>(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize));
+				uint8_t* ChunkPtr = DecryptPtr(Objects);
+				if (!ChunkPtr || Platform::IsBadReadPtr(ChunkPtr))
+					return nullptr;
+
+				void* Result = nullptr;
+				if (!TryReadObjectArrayValue(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize), Result))
+					return nullptr;
+
+				return Result;
 			};
 
-			uint8_t* FirstItem = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+			uint8_t* Objects = nullptr;
+			TryReadObjectArrayValue(GObjects + Off::FUObjectArray::GetObjectsOffset(), Objects);
+			uint8_t* FirstItem = DecryptPtr(Objects);
 
 			ObjectArray::InitializeFUObjectItem(FirstItem);
+		}
+		else if (ObjectArrayKind == EObjectArrayKind::LegacyTArray)
+		{
+			GObjects = static_cast<uint8*>(GObjectsAddress);
+			NumElementsPerChunk = 0;
+			SizeOfFUObjectItem = sizeof(void*);
+			FUObjectItemInitialOffset = 0x0;
+
+			Off::InSDK::ObjArray::GObjects = Platform::GetOffset(GObjectsAddress);
+			Off::InSDK::ObjArray::ChunkSize = 0;
+			Off::InSDK::ObjArray::FUObjectItemSize = SizeOfFUObjectItem;
+			Off::InSDK::ObjArray::FUObjectItemInitialOffset = FUObjectItemInitialOffset;
+
+			std::cerr << "Found legacy TArray<UObject*> GObjects at offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n\n";
+			std::cerr << "Off::InSDK::ObjArray::FUObjectItemSize: " << std::dec << Off::InSDK::ObjArray::FUObjectItemSize << "\n" << std::endl;
+
+			ByIndex = [](void* ObjectsArray, int32 Index, uint32, uint32, uint32) -> void*
+			{
+				if (Index < 0 || Index >= Num())
+					return nullptr;
+
+				uint8_t* Objects = nullptr;
+				if (!TryReadObjectArrayValue(ObjectsArray, Objects) || !Objects)
+					return nullptr;
+
+				uint8_t* ObjectPtrArray = DecryptPtr(Objects);
+				if (!ObjectPtrArray || Platform::IsBadReadPtr(ObjectPtrArray))
+					return nullptr;
+
+				void* Result = nullptr;
+				if (!TryReadObjectArrayValue(reinterpret_cast<void**>(ObjectPtrArray) + Index, Result))
+					return nullptr;
+
+				return Result;
+			};
 		}
 		else
 		{
 			GObjects = static_cast<uint8*>(GObjectsAddress);
 			
-			NumElementsPerChunk = Max() / MaxChunks();
+			const int32 MaxChunksValue = MaxChunks();
+			NumElementsPerChunk = MaxChunksValue > 0 ? (Max() / MaxChunksValue) : 0;
+			if (NumElementsPerChunk == 0)
+			{
+				std::cerr << "Found chunked GObjects, but chunk size could not be resolved safely\n";
+				GObjects = nullptr;
+				return;
+			}
 			Off::InSDK::ObjArray::ChunkSize = NumElementsPerChunk;
 
 			SizeOfFUObjectItem = sizeof(void*) + sizeof(int32) + sizeof(int32);
@@ -295,23 +564,43 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= Num() || PerChunk == 0)
 					return nullptr;
 
 				const int32 ChunkIndex = Index / PerChunk;
 				const int32 InChunkIdx = Index % PerChunk;
 
-				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
+				uint8_t* Objects = nullptr;
+				if (!TryReadObjectArrayValue(ObjectsArray, Objects))
+					return nullptr;
 
-				uint8_t* Chunk = reinterpret_cast<uint8_t**>(ChunkPtr)[ChunkIndex];
+				uint8_t* ChunkPtr = DecryptPtr(Objects);
+				if (!ChunkPtr || Platform::IsBadReadPtr(ChunkPtr))
+					return nullptr;
+
+				uint8_t* Chunk = nullptr;
+				if (!TryReadObjectArrayValue(reinterpret_cast<uint8_t**>(ChunkPtr) + ChunkIndex, Chunk)
+					|| !Chunk
+					|| Platform::IsBadReadPtr(Chunk))
+				{
+					return nullptr;
+				}
 				uint8_t* ItemPtr = Chunk + (InChunkIdx * FUObjectItemSize);
 
-				return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+				void* Result = nullptr;
+				if (!TryReadObjectArrayValue(ItemPtr + FUObjectItemOffset, Result))
+					return nullptr;
+
+				return Result;
 			};
 			
-			uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+			uint8_t* Objects = nullptr;
+			TryReadObjectArrayValue(GObjects + Off::FUObjectArray::GetObjectsOffset(), Objects);
+			uint8_t* ChunksPtr = DecryptPtr(Objects);
 
-			ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+			uint8_t* FirstChunk = nullptr;
+			TryReadObjectArrayValue(ChunksPtr, FirstChunk);
+			ObjectArray::InitializeFUObjectItem(FirstChunk);
 		}
 
 		return;
@@ -339,23 +628,36 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 	std::cerr << "GObjects: 0x" << (void*)GObjects << "\n" << std::endl;
 
 	Off::FUObjectArray::bIsChunked = false;
+	Off::FUObjectArray::bIsLegacyTArray = false;
 	Off::FUObjectArray::FixedLayout = ObjectArrayLayout.IsValid() ? ObjectArrayLayout : FFixedUObjectArrayLayouts[0];
 
 	ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 	{
-		if (Index < 0 || Index > Num())
+		if (Index < 0 || Index >= Num())
 			return nullptr;
 
-		uint8_t* ItemPtr = *reinterpret_cast<uint8_t**>(ObjectsArray) + (Index * FUObjectItemSize);
+		uint8_t* Objects = nullptr;
+		if (!TryReadObjectArrayValue(ObjectsArray, Objects) || !Objects)
+			return nullptr;
 
-		return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+		uint8_t* ItemPtr = Objects + (Index * FUObjectItemSize);
+
+		void* Result = nullptr;
+		if (!TryReadObjectArrayValue(ItemPtr + FUObjectItemOffset, Result))
+			return nullptr;
+
+		return Result;
 	};
 
-	uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+	uint8_t* Objects = nullptr;
+	TryReadObjectArrayValue(GObjects + Off::FUObjectArray::GetObjectsOffset(), Objects);
+	uint8_t* ChunksPtr = DecryptPtr(Objects);
 
 	std::cerr << "Overwrote FFixedUObjectArray GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
 
-	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+	uint8_t* FirstItem = nullptr;
+	TryReadObjectArrayValue(ChunksPtr, FirstItem);
+	ObjectArray::InitializeFUObjectItem(FirstItem);
 }
 
 void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChunkedFixedUObjectArrayLayout& ObjectArrayLayout, const char* const ModuleName)
@@ -364,6 +666,7 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 	Off::InSDK::ObjArray::GObjects = GObjectsOffset;
 
 	Off::FUObjectArray::bIsChunked = true;
+	Off::FUObjectArray::bIsLegacyTArray = false;
 	Off::FUObjectArray::ChunkedFixedLayout = ObjectArrayLayout.IsValid() ? ObjectArrayLayout : FChunkedFixedUObjectArrayLayouts[0];
 
 	NumElementsPerChunk = ElementsPerChunk;
@@ -371,23 +674,82 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 
 	ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 	{
-		if (Index < 0 || Index > Num())
+		if (Index < 0 || Index >= Num() || PerChunk == 0)
 			return nullptr;
 
 		const int32 ChunkIndex = Index / PerChunk;
 		const int32 InChunkIdx = Index % PerChunk;
 
-		uint8_t* Chunk = (*reinterpret_cast<uint8_t***>(ObjectsArray))[ChunkIndex];
+		uint8_t** Chunks = nullptr;
+		if (!TryReadObjectArrayValue(ObjectsArray, Chunks) || !Chunks)
+			return nullptr;
+
+		uint8_t* Chunk = nullptr;
+		if (!TryReadObjectArrayValue(Chunks + ChunkIndex, Chunk)
+			|| !Chunk
+			|| Platform::IsBadReadPtr(Chunk))
+		{
+			return nullptr;
+		}
 		uint8_t* ItemPtr = reinterpret_cast<uint8_t*>(Chunk) + (InChunkIdx * FUObjectItemSize);
 
-		return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+		void* Result = nullptr;
+		if (!TryReadObjectArrayValue(ItemPtr + FUObjectItemOffset, Result))
+			return nullptr;
+
+		return Result;
 	};
 
-	uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+	uint8_t* Objects = nullptr;
+	TryReadObjectArrayValue(GObjects + Off::FUObjectArray::GetObjectsOffset(), Objects);
+	uint8_t* ChunksPtr = DecryptPtr(Objects);
 
 	std::cerr << "Overwrote FChunkedFixedUObjectArray GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
 
-	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+	uint8_t* FirstChunk = nullptr;
+	TryReadObjectArrayValue(ChunksPtr, FirstChunk);
+	ObjectArray::InitializeFUObjectItem(FirstChunk);
+}
+
+void ObjectArray::Init(int32 GObjectsOffset, const FLegacyTArrayUObjectLayout& ObjectArrayLayout, const char* const ModuleName)
+{
+	GObjects = reinterpret_cast<uint8_t*>(Platform::GetModuleBase(ModuleName) + GObjectsOffset);
+	Off::InSDK::ObjArray::GObjects = GObjectsOffset;
+
+	Off::FUObjectArray::bIsChunked = false;
+	Off::FUObjectArray::bIsLegacyTArray = true;
+	Off::FUObjectArray::LegacyTArrayLayout = ObjectArrayLayout.IsValid() ? ObjectArrayLayout : FLegacyTArrayUObjectLayouts[0];
+
+	NumElementsPerChunk = 0;
+	SizeOfFUObjectItem = sizeof(void*);
+	FUObjectItemInitialOffset = 0x0;
+
+	Off::InSDK::ObjArray::ChunkSize = 0;
+	Off::InSDK::ObjArray::FUObjectItemSize = SizeOfFUObjectItem;
+	Off::InSDK::ObjArray::FUObjectItemInitialOffset = FUObjectItemInitialOffset;
+
+	ByIndex = [](void* ObjectsArray, int32 Index, uint32, uint32, uint32) -> void*
+	{
+		if (Index < 0 || Index >= Num())
+			return nullptr;
+
+		uint8_t* Objects = nullptr;
+		if (!TryReadObjectArrayValue(ObjectsArray, Objects) || !Objects)
+			return nullptr;
+
+		uint8_t* ObjectPtrArray = DecryptPtr(Objects);
+		if (!ObjectPtrArray || Platform::IsBadReadPtr(ObjectPtrArray))
+			return nullptr;
+
+		void* Result = nullptr;
+		if (!TryReadObjectArrayValue(reinterpret_cast<void**>(ObjectPtrArray) + Index, Result))
+			return nullptr;
+
+		return Result;
+	};
+
+	std::cerr << "Overwrote legacy TArray<UObject*> GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
+	std::cerr << "Off::InSDK::ObjArray::FUObjectItemSize: " << std::dec << Off::InSDK::ObjArray::FUObjectItemSize << "\n" << std::endl;
 }
 
 void ObjectArray::DumpObjects(const fs::path& Path, bool bWithPathname)
@@ -447,27 +809,50 @@ void ObjectArray::DumpObjectsWithProperties(const fs::path& Path, bool bWithPath
 
 int32 ObjectArray::Num()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
+	int32 Value = 0;
+	const int32 Offset = Off::FUObjectArray::GetNumElementsOffset();
+	if (!GObjects || Offset < 0 || !TryReadObjectArrayValue(GObjects + Offset, Value))
+		return 0;
+
+	return std::clamp(Value, 0, 0x800000);
 }
 
 int32 ObjectArray::Max()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetMaxElementsOffset());
+	int32 Value = 0;
+	const int32 Offset = Off::FUObjectArray::GetMaxElementsOffset();
+	if (!GObjects || Offset < 0 || !TryReadObjectArrayValue(GObjects + Offset, Value))
+		return 0;
+
+	return std::clamp(Value, 0, 0x800000);
 }
 
 int32 ObjectArray::NumChunks()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetNumChunksOffset());
+	int32 Value = 0;
+	const int32 Offset = Off::FUObjectArray::GetNumChunksOffset();
+	if (!GObjects || Offset < 0 || !TryReadObjectArrayValue(GObjects + Offset, Value))
+		return 0;
+
+	return std::clamp(Value, 0, 0x10000);
 }
 
 int32 ObjectArray::MaxChunks()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetMaxChunksOffset());
+	int32 Value = 0;
+	const int32 Offset = Off::FUObjectArray::GetMaxChunksOffset();
+	if (!GObjects || Offset < 0 || !TryReadObjectArrayValue(GObjects + Offset, Value))
+		return 0;
+
+	return std::clamp(Value, 0, 0x10000);
 }
 
 template<typename UEType>
 static UEType ObjectArray::GetByIndex(int32 Index)
 {
+	if (!GObjects || !ByIndex || Index < 0 || Index >= Num())
+		return UEType();
+
 	return UEType(ByIndex(GObjects + Off::FUObjectArray::GetObjectsOffset(), Index, SizeOfFUObjectItem, FUObjectItemInitialOffset, NumElementsPerChunk));
 }
 

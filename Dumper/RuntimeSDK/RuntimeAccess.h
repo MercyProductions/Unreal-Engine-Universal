@@ -1,20 +1,46 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
 
+#include "Platform.h"
 #include "RuntimeSDK/RuntimeSDK.h"
 
 namespace RuntimeAccess
 {
+	inline bool IsReadableRange(uintptr_t address, size_t size)
+	{
+		if (!address || size == 0)
+			return false;
+
+		const uintptr_t last = address + size - 1;
+		if (last < address)
+			return false;
+
+		return !Platform::IsBadReadPtr(reinterpret_cast<const void*>(address))
+			&& !Platform::IsBadReadPtr(reinterpret_cast<const void*>(last));
+	}
+
 	template<typename T>
 	T ReadValue(uintptr_t base, int32_t offset, T fallback = {})
 	{
 		if (!base || offset < 0)
 			return fallback;
 
-		return *reinterpret_cast<T*>(base + offset);
+		const uintptr_t address = base + static_cast<uintptr_t>(offset);
+		if (address < base || !IsReadableRange(address, sizeof(T)))
+			return fallback;
+
+		__try
+		{
+			return *reinterpret_cast<const T*>(address);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return fallback;
+		}
 	}
 
 	template<typename T>
@@ -23,7 +49,7 @@ namespace RuntimeAccess
 		if (!base || offset < 0)
 			return nullptr;
 
-		return *reinterpret_cast<T**>(base + offset);
+		return ReadValue<T*>(base, offset, nullptr);
 	}
 
 	int32_t Offset(const std::string& name);

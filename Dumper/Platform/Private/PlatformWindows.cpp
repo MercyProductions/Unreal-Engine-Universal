@@ -461,6 +461,75 @@ void* PlatformWindows::IterateAllSectionsWithCallback(const std::function<bool(v
 	return Result;
 }
 
+void* PlatformWindows::IterateSectionWithCallbackLimited(const SectionInfo& Info, const std::function<bool(void* Address)>& Callback, uint32_t Granularity, uint32_t OffsetFromEnd, uint64_t MaxIterations, uint64_t* OutIterations)
+{
+	const WindowsSectionInfo WinSectionInfo = SectionInfoToWinSectionInfo(Info);
+
+	if (!WinSectionInfo.IsValid())
+		return nullptr;
+
+	const uintptr_t SectionBaseAddrss = WinSectionInfo.Imagebase + WinSectionInfo.SectionHeader->VirtualAddress;
+	const uint32_t SectionIterationSize = GetAlignedSizeWithOffsetFromEnd(WinSectionInfo.SectionHeader->Misc.VirtualSize, Granularity, OffsetFromEnd);
+
+	if (SectionIterationSize == -1)
+		return nullptr;
+
+	uint64_t Iterations = 0;
+	for (uintptr_t CurrentAddress = SectionBaseAddrss; CurrentAddress < (SectionBaseAddrss + SectionIterationSize); CurrentAddress += Granularity)
+	{
+		if (MaxIterations != 0 && Iterations >= MaxIterations)
+			break;
+
+		Iterations++;
+
+		if (Callback(reinterpret_cast<void*>(CurrentAddress)))
+		{
+			if (OutIterations)
+				*OutIterations += Iterations;
+
+			return reinterpret_cast<void*>(CurrentAddress);
+		}
+	}
+
+	if (OutIterations)
+		*OutIterations += Iterations;
+
+	return nullptr;
+}
+
+void* PlatformWindows::IterateAllSectionsWithCallbackLimited(const std::function<bool(void* Address)>& Callback, uint32_t Granularity, uint32_t OffsetFromEnd, uint64_t MaxIterations, uint64_t* OutIterations, const char* const ModuleName)
+{
+	void* Result = nullptr;
+	uint64_t TotalIterations = 0;
+
+	const uintptr_t ModuleBase = GetModuleBase(ModuleName);
+
+	IterateAllSectionObjects(ModuleBase, [ModuleBase, &Result, &Callback, Granularity, OffsetFromEnd, MaxIterations, &TotalIterations](const IMAGE_SECTION_HEADER* Section) -> bool
+		{
+			const WindowsSectionInfo WinSectionInfo = { ModuleBase, Section };
+			const uint64_t IterationsLeft = MaxIterations == 0 ? 0 : (MaxIterations > TotalIterations ? MaxIterations - TotalIterations : 0);
+
+			if (MaxIterations != 0 && IterationsLeft == 0)
+				return true;
+
+			uint64_t SectionIterations = 0;
+			if (void* Address = IterateSectionWithCallbackLimited(WinSectionInfoToSectionInfo(WinSectionInfo), Callback, Granularity, OffsetFromEnd, IterationsLeft, &SectionIterations))
+			{
+				TotalIterations += SectionIterations;
+				Result = Address;
+				return true;
+			}
+
+			TotalIterations += SectionIterations;
+			return false;
+		});
+
+	if (OutIterations)
+		*OutIterations += TotalIterations;
+
+	return Result;
+}
+
 
 bool PlatformWindows::IsAddressInAnyModule(const uintptr_t Address)
 {

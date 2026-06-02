@@ -44,3 +44,23 @@ target("Dumper-7")
         set_objectdir("Bin/Intermediates/Debug/.objs")
         set_dependir("Bin/Intermediates/Debug/.deps")
     end
+
+target("UnrealCrashInspector")
+    set_kind("binary")
+
+    add_files("CrashInspector/*.cpp")
+
+    add_defines("_CONSOLE", "UNICODE", "_UNICODE", "WIN32", "WIN32_LEAN_AND_MEAN", "NOMINMAX")
+    add_links("shell32")
+
+    if is_mode("release") then
+        set_runtimes("MD")
+        set_targetdir("Bin/Release/")
+        set_objectdir("Bin/Intermediates/Release/.crashinspector_objs")
+        set_dependir("Bin/Intermediates/Release/.crashinspector_deps")
+    else
+        set_runtimes("MDd")
+        set_targetdir("Bin/Debug/")
+        set_objectdir("Bin/Intermediates/Debug/.crashinspector_objs")
+        set_dependir("Bin/Intermediates/Debug/.crashinspector_deps")
+    end

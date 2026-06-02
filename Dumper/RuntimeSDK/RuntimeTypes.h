@@ -5,6 +5,17 @@
 #include <utility>
 #include <vector>
 
+enum class RuntimeEngineGeneration : uint8_t
+{
+	Unknown = 0,
+	UnrealEngine1,
+	UnrealEngine2,
+	UnrealEngine3,
+	UnrealEngine4,
+	UnrealEngine5,
+	UnrealEngine6
+};
+
 struct RuntimePropertyInfo
 {
 	std::string ownerName;
@@ -74,6 +85,13 @@ struct RuntimeEnumInfo
 struct RuntimeGlobalOffsets
 {
 	uintptr_t imageBase = 0;
+
+	RuntimeEngineGeneration engineGeneration = RuntimeEngineGeneration::Unknown;
+	std::string engineGenerationName;
+
+	bool usesFProperty = false;
+	bool usesFField = false;
+	bool legacyRuntime = false;
 
 	int32_t gObjects = -1;
 	int32_t gNames = -1;

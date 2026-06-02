@@ -175,6 +175,61 @@ namespace
 
 		return valid;
 	}
+
+	bool HasAnyStruct(const RuntimeDatabase& db, std::initializer_list<const char*> names)
+	{
+		for (const char* name : names)
+		{
+			if (db.HasStruct(name))
+				return true;
+		}
+
+		return false;
+	}
+
+	bool ValidateLegacyRuntime(const RuntimeDatabase& db)
+	{
+		const RuntimeGlobalOffsets& globals = db.Globals();
+		const std::string generationName = globals.engineGenerationName.empty()
+			? "legacy Unreal Engine"
+			: globals.engineGenerationName;
+
+		std::cerr << "[RuntimeSDK] Legacy Unreal generation detected: " << generationName << "\n";
+
+		bool metadataValid = true;
+		if (globals.gObjects < 0)
+		{
+			std::cerr << "[RuntimeSDK] Missing global: GObjects\n";
+			metadataValid = false;
+		}
+
+		if (globals.gNames < 0)
+		{
+			std::cerr << "[RuntimeSDK] Missing global: GNames\n";
+			metadataValid = false;
+		}
+
+		if (globals.processEvent < 0 && globals.processEventIndex < 0)
+		{
+			std::cerr << "[RuntimeSDK] Missing global: ProcessEvent\n";
+			metadataValid = false;
+		}
+
+		if (!HasAnyStruct(db, { "UObject", "Object", "Core.Object" }))
+			std::cerr << "[RuntimeSDK] Legacy core class not indexed yet: UObject/Object\n";
+		if (!HasAnyStruct(db, { "UClass", "Class", "Core.Class" }))
+			std::cerr << "[RuntimeSDK] Legacy core class not indexed yet: UClass/Class\n";
+
+		if (!metadataValid)
+			std::cerr << "[RuntimeSDK] Legacy metadata validation completed with missing entries\n";
+		else
+			std::cerr << "[RuntimeSDK] Legacy metadata validation passed\n";
+
+		std::cerr << "[RuntimeSDK] UE1/UE2/UE3 runtime profile is recognized, but the UE4+ overlay path is disabled for this engine generation\n";
+		std::cerr << "[RuntimeSDK] Legacy object/name/property layout resolver must be selected before starting overlay features\n";
+
+		return false;
+	}
 }
 
 bool RuntimeValidation::Validate(const RuntimeDatabase& db)
@@ -183,6 +238,9 @@ bool RuntimeValidation::Validate(const RuntimeDatabase& db)
 	bool optionalComplete = true;
 
 	const RuntimeGlobalOffsets& globals = db.Globals();
+	if (globals.legacyRuntime)
+		return ValidateLegacyRuntime(db);
+
 	if (globals.gObjects < 0)
 	{
 		std::cerr << "[RuntimeSDK] Missing global: GObjects\n";

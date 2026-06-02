@@ -1,5 +1,7 @@
 
 #include <format>
+#include <cstring>
+#include <algorithm>
 
 #include "Unreal/ObjectArray.h"
 #include "Unreal/NameArray.h"
@@ -8,6 +10,54 @@
 #include "Architecture.h"
 
 uint8* NameArray::GNames = nullptr;
+
+namespace
+{
+	template<typename T>
+	bool TryReadNameArrayValue(const void* Address, T& OutValue)
+	{
+		if (!Address || Platform::IsBadReadPtr(Address))
+			return false;
+
+		__try
+		{
+			OutValue = *reinterpret_cast<const T*>(Address);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	bool NameEntryContainsAnsiString(const uint8_t* Entry, const char* Text, int32 SearchBytes = 0x40)
+	{
+		if (!Entry || !Text || Platform::IsBadReadPtr(Entry))
+			return false;
+
+		const size_t TextLen = strlen(Text);
+		if (TextLen == 0 || TextLen >= static_cast<size_t>(SearchBytes))
+			return false;
+
+		for (int32 Offset = 0; Offset <= SearchBytes - static_cast<int32>(TextLen); ++Offset)
+		{
+			const char* Candidate = reinterpret_cast<const char*>(Entry + Offset);
+			if (Platform::IsBadReadPtr(Candidate))
+				continue;
+
+			__try
+			{
+				if (memcmp(Candidate, Text, TextLen) == 0)
+					return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+			}
+		}
+
+		return false;
+	}
+}
 
 FNameEntry::FNameEntry(void* Ptr)
 	: Address((uint8*)Ptr)
@@ -104,13 +154,25 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 	}
 	else
 	{
+		bNameArrayIndexHasWideMask = true;
+
 		const uint8_t* FNameEntryNone =     static_cast<uint8_t*>(NameArray::GetNameEntry(0x0).GetAddress());
 		const uint8_t* FNameEntryIdxThree = static_cast<uint8_t*>(NameArray::GetNameEntry(0x3).GetAddress());
 		const uint8_t* FNameEntryIdxEight = static_cast<uint8_t*>(NameArray::GetNameEntry(0x8).GetAddress());
 
+		if (!FNameEntryNone || !FNameEntryIdxThree || !FNameEntryIdxEight
+			|| Platform::IsBadReadPtr(FNameEntryNone)
+			|| Platform::IsBadReadPtr(FNameEntryIdxThree)
+			|| Platform::IsBadReadPtr(FNameEntryIdxEight))
+		{
+			GetStr = [](uint8*) -> std::wstring { return L""; };
+			return;
+		}
+
 		for (int i = 0; i < 0x20; i++)
 		{
-			if (*reinterpret_cast<const uint32*>(FNameEntryNone + i) == 'enoN') // None
+			uint32 PossibleNone = 0;
+			if (TryReadNameArrayValue(FNameEntryNone + i, PossibleNone) && PossibleNone == 'enoN') // None
 			{
 				Off::FNameEntry::NameArray::StringOffset = i;
 				break;
@@ -120,10 +182,25 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 		for (int i = 0; i < 0x20; i++)
 		{
 			// lowest bit is bIsWide mask, shift right by 1 to get the index
-			if ((*reinterpret_cast<const uint32*>(FNameEntryIdxThree + i) >> 1) == 0x3 &&
-				(*reinterpret_cast<const uint32*>(FNameEntryIdxEight + i) >> 1) == 0x8)
+			uint32 IdxThree = 0;
+			uint32 IdxEight = 0;
+			if (!TryReadNameArrayValue(FNameEntryIdxThree + i, IdxThree)
+				|| !TryReadNameArrayValue(FNameEntryIdxEight + i, IdxEight))
+			{
+				continue;
+			}
+
+			if ((IdxThree >> 1) == 0x3 && (IdxEight >> 1) == 0x8)
 			{
 				Off::FNameEntry::NameArray::IndexOffset = i;
+				bNameArrayIndexHasWideMask = true;
+				break;
+			}
+
+			if (IdxThree == 0x3 && IdxEight == 0x8)
+			{
+				Off::FNameEntry::NameArray::IndexOffset = i;
+				bNameArrayIndexHasWideMask = false;
 				break;
 			}
 		}
@@ -133,7 +210,7 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 			const int32 NameIdx = *reinterpret_cast<int32*>(NameEntry + Off::FNameEntry::NameArray::IndexOffset);
 			const void* NameString = reinterpret_cast<void*>(NameEntry + Off::FNameEntry::NameArray::StringOffset);
 
-			if (NameIdx & NameWideMask)
+			if (bNameArrayIndexHasWideMask && (NameIdx & NameWideMask))
 				return std::wstring(reinterpret_cast<const wchar_t*>(NameString));
 
 			return UtfN::StringToWString<std::string>(reinterpret_cast<const char*>(NameString));
@@ -190,6 +267,81 @@ bool NameArray::InitializeNameArray(uint8_t* NameArray)
 	}
 
 	return false;
+}
+
+bool NameArray::InitializeLegacyNameArray(uint8_t* NameArray)
+{
+	uint8_t* Entries = nullptr;
+	int32 NumElements = 0;
+	int32 MaxElements = 0;
+
+	if (!NameArray || Platform::IsBadReadPtr(NameArray)
+		|| !TryReadNameArrayValue(NameArray, Entries)
+		|| !TryReadNameArrayValue(NameArray + sizeof(void*), NumElements)
+		|| !TryReadNameArrayValue(NameArray + sizeof(void*) + sizeof(int32), MaxElements))
+	{
+		return false;
+	}
+
+	if (!Entries || Platform::IsBadReadPtr(Entries))
+		return false;
+
+	if (NumElements <= 0x100 || NumElements > MaxElements || MaxElements > 0x400000)
+		return false;
+
+	uint8_t* NoneEntry = nullptr;
+	if (!TryReadNameArrayValue(reinterpret_cast<uint8_t**>(Entries), NoneEntry)
+		|| !NoneEntry
+		|| Platform::IsBadReadPtr(NoneEntry)
+		|| !NameEntryContainsAnsiString(NoneEntry, "None"))
+	{
+		return false;
+	}
+
+	bool bFoundCommonPropertyName = false;
+	const int32 SampleLimit = NumElements < 0x80 ? NumElements : 0x80;
+	for (int32 Index = 1; Index < SampleLimit; ++Index)
+	{
+		uint8_t* Entry = nullptr;
+		if (!TryReadNameArrayValue(reinterpret_cast<uint8_t**>(Entries) + Index, Entry)
+			|| !Entry
+			|| Platform::IsBadReadPtr(Entry))
+		{
+			continue;
+		}
+
+		if (NameEntryContainsAnsiString(Entry, "ByteProperty")
+			|| NameEntryContainsAnsiString(Entry, "IntProperty")
+			|| NameEntryContainsAnsiString(Entry, "ObjectProperty"))
+		{
+			bFoundCommonPropertyName = true;
+			break;
+		}
+	}
+
+	if (!bFoundCommonPropertyName)
+		return false;
+
+	Off::NameArray::NumElements = sizeof(void*);
+	Off::NameArray::MaxChunkIndex = sizeof(void*) + sizeof(int32);
+
+	ByIndex = [](void* NamesArray, int32 ComparisonIndex, int32) -> void*
+	{
+		if (ComparisonIndex < 0 || ComparisonIndex >= NameArray::GetNumElements())
+			return nullptr;
+
+		uint8_t* Entries = nullptr;
+		if (!TryReadNameArrayValue(NamesArray, Entries) || !Entries || Platform::IsBadReadPtr(Entries))
+			return nullptr;
+
+		uint8_t* Entry = nullptr;
+		if (!TryReadNameArrayValue(reinterpret_cast<uint8_t**>(Entries) + ComparisonIndex, Entry))
+			return nullptr;
+
+		return Entry;
+	};
+
+	return true;
 }
 
 bool NameArray::InitializeNamePool(uint8_t* NamePool)
@@ -417,6 +569,28 @@ bool NameArray::TryFindNameArray_Windows()
 #endif // PLATFORM_WINDOWS
 }
 
+bool NameArray::TryFindLegacyNameArray_Windows()
+{
+#ifdef PLATFORM_WINDOWS
+
+	auto IsLegacyNameArray = [](void* CurrentAddress) -> bool
+	{
+		return NameArray::InitializeLegacyNameArray(static_cast<uint8_t*>(CurrentAddress));
+	};
+
+	void* GNamesAddress = Platform::IterateSectionWithCallback(Platform::GetSectionInfo(".data"), IsLegacyNameArray, 0x4, 0x10);
+	if (!GNamesAddress)
+		GNamesAddress = Platform::IterateAllSectionsWithCallback(IsLegacyNameArray, 0x4, 0x10);
+
+	if (!GNamesAddress)
+		return false;
+
+	Off::InSDK::NameArray::GNames = Platform::GetOffset(GNamesAddress);
+	return true;
+
+#endif // PLATFORM_WINDOWS
+}
+
 bool NameArray::TryFindNamePool_Windows()
 {
 #ifdef PLATFORM_WINDOWS
@@ -506,14 +680,17 @@ bool NameArray::TryInit(bool bIsTestOnly)
 	const uintptr_t ImageBase = Platform::GetModuleBase();
 
 	uint8* GNamesAddress = nullptr;
+	uint8* GNamesDirectAddress = nullptr;
 
 	bool bFoundNameArray = false;
+	bool bFoundLegacyNameArray = false;
 	bool bFoundnamePool = false;
 
 	if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindNameArray))
 	{
 		std::cerr << std::format("Found 'TNameEntryArray GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
-		GNamesAddress = *reinterpret_cast<uint8**>(ImageBase + Off::InSDK::NameArray::GNames);// Derefernce
+		GNamesDirectAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames);
+		TryReadNameArrayValue(GNamesDirectAddress, GNamesAddress);// Derefernce
 		Settings::Internal::bUseNamePool = false;
 		bFoundNameArray = true;
 	}
@@ -524,8 +701,16 @@ bool NameArray::TryInit(bool bIsTestOnly)
 		Settings::Internal::bUseNamePool = true;
 		bFoundnamePool = true;
 	}
+	else if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindLegacyNameArray))
+	{
+		std::cerr << std::format("Found legacy 'TArray<FNameEntry*> GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
+		GNamesDirectAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames);
+		GNamesAddress = GNamesDirectAddress;
+		Settings::Internal::bUseNamePool = false;
+		bFoundLegacyNameArray = true;
+	}
 
-	if (!bFoundNameArray && !bFoundnamePool)
+	if (!bFoundNameArray && !bFoundnamePool && !bFoundLegacyNameArray)
 	{
 		std::cerr << "\n\nCould not find GNames!\n\n" << std::endl;
 		return false;
@@ -535,6 +720,20 @@ bool NameArray::TryInit(bool bIsTestOnly)
 		return false;
 
 	if (bFoundNameArray && NameArray::InitializeNameArray(GNamesAddress))
+	{
+		GNames = GNamesAddress;
+		Settings::Internal::bUseNamePool = false;
+		FNameEntry::Init();
+		return true;
+	}
+	else if (bFoundNameArray && NameArray::InitializeLegacyNameArray(GNamesDirectAddress))
+	{
+		GNames = GNamesDirectAddress;
+		Settings::Internal::bUseNamePool = false;
+		FNameEntry::Init();
+		return true;
+	}
+	else if (bFoundLegacyNameArray && NameArray::InitializeLegacyNameArray(GNamesAddress))
 	{
 		GNames = GNamesAddress;
 		Settings::Internal::bUseNamePool = false;
@@ -560,6 +759,7 @@ bool NameArray::TryInit(int32 OffsetOverride, bool bIsNamePool, const char* cons
 	const uintptr_t ImageBase = Platform::GetModuleBase(ModuleName);
 
 	uint8* GNamesAddress = nullptr;
+	uint8* GNamesDirectAddress = nullptr;
 
 	const bool bIsNameArrayOverride = !bIsNamePool;
 	const bool bIsNamePoolOverride = bIsNamePool;
@@ -572,7 +772,8 @@ bool NameArray::TryInit(int32 OffsetOverride, bool bIsNamePool, const char* cons
 	if (bIsNameArrayOverride)
 	{
 		std::cerr << std::format("Overwrote offset: 'TNameEntryArray GNames' set as offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
-		GNamesAddress = *reinterpret_cast<uint8**>(ImageBase + Off::InSDK::NameArray::GNames);// Derefernce
+		GNamesDirectAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames);
+		TryReadNameArrayValue(GNamesDirectAddress, GNamesAddress);// Derefernce
 		Settings::Internal::bUseNamePool = false;
 		bFoundNameArray = true;
 	}
@@ -593,6 +794,13 @@ bool NameArray::TryInit(int32 OffsetOverride, bool bIsNamePool, const char* cons
 	if (bFoundNameArray && NameArray::InitializeNameArray(GNamesAddress))
 	{
 		GNames = GNamesAddress;
+		Settings::Internal::bUseNamePool = false;
+		FNameEntry::Init();
+		return true;
+	}
+	else if (bFoundNameArray && NameArray::InitializeLegacyNameArray(GNamesDirectAddress))
+	{
+		GNames = GNamesDirectAddress;
 		Settings::Internal::bUseNamePool = false;
 		FNameEntry::Init();
 		return true;
@@ -626,6 +834,12 @@ bool NameArray::SetGNamesWithoutCommitting()
 	{
 		std::cerr << std::format("Found 'FNamePool GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
 		Settings::Internal::bUseNamePool = true;
+		return true;
+	}
+	else if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindLegacyNameArray))
+	{
+		std::cerr << std::format("Found legacy 'TArray<FNameEntry*> GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
+		Settings::Internal::bUseNamePool = false;
 		return true;
 	}
 
@@ -697,4 +911,3 @@ FNameEntry NameArray::GetNameEntry(int32 Idx)
 {
 	return ByIndex(GNames, Idx, FNameBlockOffsetBits);
 }
-

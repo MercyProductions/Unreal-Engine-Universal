@@ -28,6 +28,7 @@ void Generator::InitEngineCore()
 	/* manual override */
 	//ObjectArray::Init(/*GObjects*/, /*Layout = Default*/); // FFixedUObjectArray (UEVersion < UE4.21)
 	//ObjectArray::Init(/*GObjects*/, /*ChunkSize*/, /*Layout = Default*/); // FChunkedFixedUObjectArray (UEVersion >= UE4.21)
+	//ObjectArray::Init(/*GObjects*/, FLegacyTArrayUObjectLayout{}); // Legacy TArray<UObject*> (UE1/UE2/UE3)
 
 	//FName::Init(/*bForceGNames = false*/);
 	//FName::Init(/*AppendString, FName::EOffsetOverrideType::AppendString*/);

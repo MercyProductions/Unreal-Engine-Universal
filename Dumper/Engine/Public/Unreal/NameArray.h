@@ -12,6 +12,7 @@ private:
 
 private:
 	static inline int32 FNameEntryLengthShiftCount = 0x0;
+	static inline bool bNameArrayIndexHasWideMask = true;
 
 	static inline std::wstring(*GetStr)(uint8* NameEntry) = nullptr;
 
@@ -47,11 +48,13 @@ private:
 
 private:
 	static bool InitializeNameArray(uint8_t* NameArray);
+	static bool InitializeLegacyNameArray(uint8_t* NameArray);
 	static bool InitializeNamePool(uint8_t* NamePool);
 
 public:
 	/* Should be changed later and combined */
 	static bool TryFindNameArray_Windows();
+	static bool TryFindLegacyNameArray_Windows();
 	static bool TryFindNamePool_Windows();
 
 	static bool TryInit(bool bIsTestOnly = false);

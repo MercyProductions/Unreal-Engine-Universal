@@ -1,6 +1,7 @@
 #include "RuntimeSDK/RuntimeResolver.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 
@@ -18,6 +19,56 @@
 
 namespace
 {
+	RuntimeEngineGeneration DetectGenerationFromVersionString(const std::string& version)
+	{
+		size_t pos = 0;
+		while (pos < version.size() && std::isspace(static_cast<unsigned char>(version[pos])))
+			pos++;
+
+		if (pos >= version.size() || !std::isdigit(static_cast<unsigned char>(version[pos])))
+			return RuntimeEngineGeneration::Unknown;
+
+		const int major = version[pos] - '0';
+		switch (major)
+		{
+		case 1:
+			return RuntimeEngineGeneration::UnrealEngine1;
+		case 2:
+			return RuntimeEngineGeneration::UnrealEngine2;
+		case 3:
+			return RuntimeEngineGeneration::UnrealEngine3;
+		case 4:
+			return RuntimeEngineGeneration::UnrealEngine4;
+		case 5:
+			return RuntimeEngineGeneration::UnrealEngine5;
+		case 6:
+			return RuntimeEngineGeneration::UnrealEngine6;
+		default:
+			return RuntimeEngineGeneration::Unknown;
+		}
+	}
+
+	const char* GenerationName(RuntimeEngineGeneration generation)
+	{
+		switch (generation)
+		{
+		case RuntimeEngineGeneration::UnrealEngine1:
+			return "Unreal Engine 1";
+		case RuntimeEngineGeneration::UnrealEngine2:
+			return "Unreal Engine 2";
+		case RuntimeEngineGeneration::UnrealEngine3:
+			return "Unreal Engine 3";
+		case RuntimeEngineGeneration::UnrealEngine4:
+			return "Unreal Engine 4";
+		case RuntimeEngineGeneration::UnrealEngine5:
+			return "Unreal Engine 5";
+		case RuntimeEngineGeneration::UnrealEngine6:
+			return "Unreal Engine 6";
+		default:
+			return "Unknown Unreal Engine";
+		}
+	}
+
 	std::string StructRuntimeName(const StructWrapper& Struct)
 	{
 		if (Struct.IsUnrealStruct() && Struct.GetUnrealStruct())
@@ -234,6 +285,9 @@ namespace
 	{
 		RuntimeGlobalOffsets& globals = db.Globals();
 		globals.imageBase = Platform::GetModuleBase(Settings::General::DefaultModuleName);
+		globals.engineGeneration = DetectGenerationFromVersionString(Settings::Generator::GameVersion);
+		globals.usesFProperty = Settings::Internal::bUseFProperty;
+		globals.usesFField = Settings::Internal::bUseFProperty;
 		globals.gObjects = Off::InSDK::ObjArray::GObjects;
 		globals.gNames = Off::InSDK::NameArray::GNames;
 		globals.gWorld = Off::InSDK::World::GWorld;
@@ -246,6 +300,39 @@ namespace
 			globals.toString = Off::InSDK::Name::AppendNameToString;
 
 		globals.uLevelActors = Off::InSDK::ULevel::Actors;
+	}
+
+	void UpdateGenerationFromDatabase(RuntimeDatabase& db)
+	{
+		RuntimeGlobalOffsets& globals = db.Globals();
+		RuntimeEngineGeneration generation = globals.engineGeneration;
+
+		if (generation == RuntimeEngineGeneration::Unknown)
+		{
+			const bool hasUE5Hints = db.HasStruct("WorldPartition")
+				|| db.HasStruct("MassEntitySubsystem")
+				|| db.HasStruct("EnhancedInputLocalPlayerSubsystem");
+			const bool hasUE4PlusProfile = db.HasStruct("UGameInstance")
+				|| db.HasStruct("GameInstance")
+				|| db.HasStruct("UKismetSystemLibrary")
+				|| db.HasStruct("KismetSystemLibrary");
+			const bool hasUE3Profile = db.HasStruct("GameViewportClient")
+				&& db.HasStruct("PlayerController")
+				&& !hasUE4PlusProfile;
+
+			if (hasUE5Hints)
+				generation = RuntimeEngineGeneration::UnrealEngine5;
+			else if (hasUE4PlusProfile || globals.usesFProperty)
+				generation = RuntimeEngineGeneration::UnrealEngine4;
+			else if (hasUE3Profile)
+				generation = RuntimeEngineGeneration::UnrealEngine3;
+		}
+
+		globals.engineGeneration = generation;
+		globals.engineGenerationName = GenerationName(generation);
+		globals.legacyRuntime = generation == RuntimeEngineGeneration::UnrealEngine1
+			|| generation == RuntimeEngineGeneration::UnrealEngine2
+			|| generation == RuntimeEngineGeneration::UnrealEngine3;
 	}
 }
 
@@ -310,6 +397,11 @@ bool RuntimeResolver::BuildFromReflection(RuntimeDatabase& db)
 	std::cerr << "[RuntimeSDK] Properties resolved: " << propertyCount << "\n";
 	std::cerr << "[RuntimeSDK] Functions resolved: " << functionCount << "\n";
 	std::cerr << "[RuntimeSDK] Enums resolved: " << enumCount << "\n";
+	UpdateGenerationFromDatabase(db);
+	std::cerr << "[RuntimeSDK] Engine generation detected: " << db.Globals().engineGenerationName;
+	if (db.Globals().legacyRuntime)
+		std::cerr << " (legacy runtime profile)";
+	std::cerr << "\n";
 
 	return structCount > 0;
 }

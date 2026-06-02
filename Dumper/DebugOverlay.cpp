@@ -24,7 +24,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -69,7 +71,7 @@ namespace
 	constexpr size_t ResizeBuffersVTableIndex = 13;
 	constexpr size_t ExecuteCommandListsVTableIndex = 10;
 	constexpr size_t AbsoluteJumpSize = 14;
-	constexpr int kOverlayConfigVersion = 2;
+	constexpr int kOverlayConfigVersion = 6;
 
 	enum class RenderBackend
 	{
@@ -189,6 +191,7 @@ namespace
 		Weapon,
 		Vehicle,
 		Objective,
+		Dead,
 		ClassFilter,
 		ClassExcludeFilter,
 		TargetMode,
@@ -226,6 +229,8 @@ namespace
 			return "Vehicle";
 		case ActorFilterReason::Objective:
 			return "Objective";
+		case ActorFilterReason::Dead:
+			return "Dead";
 		case ActorFilterReason::ClassFilter:
 			return "Class filter";
 		case ActorFilterReason::ClassExcludeFilter:
@@ -325,10 +330,13 @@ namespace
 		bool IsWeapon = false;
 		bool IsVehicle = false;
 		bool IsObjective = false;
+		bool HasLifeState = false;
+		bool IsDead = false;
 		bool HasPlayerState = false;
 		bool IsRuntimePlayer = false;
 		ActorFilterReason FilterReason = ActorFilterReason::None;
 		uintptr_t PlayerStateAddress = 0;
+		float HealthValue = 0.0f;
 		Vec2 Screen;
 		Vec2 ScreenTop;
 		Vec2 ScreenBottom;
@@ -337,6 +345,7 @@ namespace
 		std::vector<SkeletonBonePoint> SkeletonBones;
 		std::vector<SkeletonSegment> SkeletonSegments;
 		std::string SkeletonSource;
+		std::string LifeStateSource;
 		DWORD LastReflectedPositionTick = 0;
 		bool HasSkeleton = false;
 	};
@@ -377,6 +386,7 @@ namespace
 		int32 FilteredWeapon = 0;
 		int32 FilteredVehicle = 0;
 		int32 FilteredObjective = 0;
+		int32 FilteredDead = 0;
 		int32 FilteredClass = 0;
 		int32 FilteredClassExclude = 0;
 		int32 FilteredTargetMode = 0;
@@ -393,6 +403,8 @@ namespace
 		int32 WeaponActors = 0;
 		int32 VehicleActors = 0;
 		int32 ObjectiveActors = 0;
+		int32 LifeStateActors = 0;
+		int32 DeadActors = 0;
 		int32 RuntimeContextActors = 0;
 		int32 PlayerStateActors = 0;
 		int32 RuntimePlayerStates = 0;
@@ -403,6 +415,8 @@ namespace
 		int32 PositionProbeCacheMisses = 0;
 		int32 MeshProbeCacheHits = 0;
 		int32 MeshProbeCacheMisses = 0;
+		int32 LifeStateProbeCacheHits = 0;
+		int32 LifeStateProbeCacheMisses = 0;
 		bool UsedDesktopProjection = false;
 		bool SymbolsReady = false;
 		bool HasPlayerController = false;
@@ -441,6 +455,7 @@ namespace
 	struct OverlayConfig
 	{
 		bool Enabled = true;
+		bool ActorCaptureEnabled = false;
 		bool DrawLines = true;
 		bool DrawBoxes = true;
 		bool DrawNames = true;
@@ -458,6 +473,7 @@ namespace
 		bool OnlyWithLocation = true;
 		bool OnlyInView = false;
 		bool ExternalOverlayOnStreamline = true;
+		bool ExternalOverlayOnD3D12 = true;
 		bool UseProjectionFallback = true;
 		bool ClampLargeBoxes = true;
 		bool HideEnvironmentActors = true;
@@ -471,6 +487,7 @@ namespace
 		bool HideWeapons = false;
 		bool HideVehicles = false;
 		bool HideObjectives = false;
+		bool HideDeadActors = true;
 		bool UseRuntimePlayerContext = true;
 		bool PreferRuntimePlayers = true;
 		bool IncludeGameStatePlayers = true;
@@ -786,11 +803,17 @@ namespace
 
 	std::thread gCaptureThread;
 	std::thread gExternalRenderThread;
+	std::mutex gCaptureThreadStateMutex;
+	std::atomic_bool gCaptureThreadRequested = false;
+	std::atomic_bool gCaptureThreadLive = false;
+	std::atomic<DWORD> gCapturePausedUntilTick = 0;
+	std::atomic<uintptr_t> gLastCaptureWorldAddress = 0;
 	std::mutex gActorMutex;
 	std::mutex gConfigMutex;
 	std::mutex gCaptureMutex;
 	std::mutex gClassObjectCacheMutex;
 	std::mutex gPositionProbeCacheMutex;
+	std::mutex gLifeStateProbeCacheMutex;
 	std::mutex gMeshProbeCacheMutex;
 
 	std::vector<ActorDebugInfo> gActors;
@@ -827,6 +850,16 @@ namespace
 		GetterFunction
 	};
 
+	enum class LifeStateProbeKind
+	{
+		DeadBoolProperty,
+		AliveBoolProperty,
+		HealthNumberProperty,
+		DeadBoolFunction,
+		AliveBoolFunction,
+		HealthNumberFunction
+	};
+
 	struct CachedPositionProbe
 	{
 		PositionProbeKind Kind = PositionProbeKind::VectorProperty;
@@ -842,6 +875,21 @@ namespace
 		DWORD BuiltTick = 0;
 	};
 
+	struct CachedLifeStateProbe
+	{
+		LifeStateProbeKind Kind = LifeStateProbeKind::DeadBoolProperty;
+		UEProperty Property;
+		UEFunction Function;
+		std::string Source;
+	};
+
+	struct CachedLifeStateProbePlan
+	{
+		bool Built = false;
+		std::vector<CachedLifeStateProbe> Probes;
+		DWORD BuiltTick = 0;
+	};
+
 	struct CachedMeshProbePlan
 	{
 		bool Built = false;
@@ -853,6 +901,7 @@ namespace
 
 	std::unordered_map<uintptr_t, CachedClassObject> gClassObjectCache;
 	std::unordered_map<uintptr_t, CachedPositionProbePlan> gPositionProbeCache;
+	std::unordered_map<uintptr_t, CachedLifeStateProbePlan> gLifeStateProbeCache;
 	std::unordered_map<uintptr_t, CachedMeshProbePlan> gMeshProbeCache;
 
 	RenderBackend gBackend = RenderBackend::Unknown;
@@ -1190,6 +1239,40 @@ namespace
 		Config.DeveloperPreviewEnabled = false;
 	}
 
+	void ResetFastOverlayCadenceDefaults(OverlayConfig& Config)
+	{
+		Config.FastOverlayMode = true;
+		Config.CaptureOnRenderFrame = false;
+		Config.FrameCaptureMinMs = 8;
+		Config.FrameProjectionMaxActors = std::clamp(std::max(Config.FrameProjectionMaxActors, 128), 128, 256);
+		Config.FrameSkeletonMinMs = std::max(Config.FrameSkeletonMinMs, 1000);
+		Config.ReflectedPositionRefreshMs = std::min(Config.ReflectedPositionRefreshMs, 250);
+		Config.RefreshMs = std::max(Config.RefreshMs, 1000);
+		Config.MaxActors = std::clamp(std::max(Config.MaxActors, 256), 256, 512);
+	}
+
+	void ResetLifeStateDefaults(OverlayConfig& Config)
+	{
+		Config.HideDeadActors = true;
+	}
+
+	void ResetRendererSafetyDefaults(OverlayConfig& Config)
+	{
+		Config.RendererRoute = 0;
+		Config.ExternalOverlayOnStreamline = true;
+		Config.ExternalOverlayOnD3D12 = true;
+	}
+
+	void ResetActorCaptureSafetyDefaults(OverlayConfig& Config)
+	{
+		Config.ActorCaptureEnabled = false;
+		Config.CaptureOnRenderFrame = false;
+		Config.UseReflectedPositionFallback = false;
+		Config.UseRuntimePlayerContext = false;
+		Config.ProbeReflectedPositionsOnLocatedActors = false;
+		Config.DrawSkeletons = false;
+	}
+
 	void EnsureRuntimeTokenDefaults(OverlayConfig& Config)
 	{
 		if (Config.PlayerFilter[0] == '\0')
@@ -1438,6 +1521,32 @@ namespace
 		gStats.Status = std::move(Status);
 	}
 
+	void LogOverlayRuntimeError(const char* Context, const char* Message)
+	{
+		const char* SafeContext = Context ? Context : "Overlay";
+		const char* SafeMessage = Message ? Message : "unknown exception";
+
+		std::cerr << "[Overlay] " << SafeContext << " failed: " << SafeMessage << "\n";
+
+		try
+		{
+			std::filesystem::create_directories(Settings::Generator::SDKGenerationPath);
+			std::ofstream Log(std::filesystem::path(Settings::Generator::SDKGenerationPath) / "DumperRuntimeErrors.log", std::ios::app);
+			if (Log.is_open())
+				Log << GetTickCount64() << " [" << SafeContext << "] " << SafeMessage << "\n";
+		}
+		catch (...)
+		{
+		}
+	}
+
+	void LogOverlayStructuredException(const char* Context, DWORD Code)
+	{
+		char Buffer[64] = {};
+		std::snprintf(Buffer, sizeof(Buffer), "structured exception 0x%08lX", static_cast<unsigned long>(Code));
+		LogOverlayRuntimeError(Context, Buffer);
+	}
+
 	bool ReadConfigBool(const char* Key, bool DefaultValue)
 	{
 		return GetPrivateProfileIntA("DebugOverlay", Key, DefaultValue ? 1 : 0, Settings::GlobalConfigPath) != 0;
@@ -1504,6 +1613,7 @@ namespace
 
 		std::scoped_lock Lock(gConfigMutex);
 		gConfig.Enabled = ReadConfigBool("Enabled", gConfig.Enabled);
+		gConfig.ActorCaptureEnabled = ReadConfigBool("ActorCaptureEnabled", gConfig.ActorCaptureEnabled);
 		gConfig.DrawLines = ReadConfigBool("DrawLines", gConfig.DrawLines);
 		gConfig.DrawBoxes = ReadConfigBool("DrawBoxes", gConfig.DrawBoxes);
 		gConfig.DrawNames = ReadConfigBool("DrawNames", gConfig.DrawNames);
@@ -1521,6 +1631,7 @@ namespace
 		gConfig.OnlyWithLocation = ReadConfigBool("OnlyWithLocation", gConfig.OnlyWithLocation);
 		gConfig.OnlyInView = ReadConfigBool("OnlyInView", gConfig.OnlyInView);
 		gConfig.ExternalOverlayOnStreamline = ReadConfigBool("ExternalOverlayOnStreamline", gConfig.ExternalOverlayOnStreamline);
+		gConfig.ExternalOverlayOnD3D12 = ReadConfigBool("ExternalOverlayOnD3D12", gConfig.ExternalOverlayOnD3D12);
 		gConfig.UseProjectionFallback = ReadConfigBool("UseProjectionFallback", gConfig.UseProjectionFallback);
 		gConfig.ClampLargeBoxes = ReadConfigBool("ClampLargeBoxes", gConfig.ClampLargeBoxes);
 		gConfig.HideEnvironmentActors = ReadConfigBool("HideEnvironmentActors", gConfig.HideEnvironmentActors);
@@ -1534,6 +1645,7 @@ namespace
 		gConfig.HideWeapons = ReadConfigBool("HideWeapons", gConfig.HideWeapons);
 		gConfig.HideVehicles = ReadConfigBool("HideVehicles", gConfig.HideVehicles);
 		gConfig.HideObjectives = ReadConfigBool("HideObjectives", gConfig.HideObjectives);
+		gConfig.HideDeadActors = ReadConfigBool("HideDeadActors", gConfig.HideDeadActors);
 		gConfig.UseRuntimePlayerContext = ReadConfigBool("UseRuntimePlayerContext", gConfig.UseRuntimePlayerContext);
 		gConfig.PreferRuntimePlayers = ReadConfigBool("PreferRuntimePlayers", gConfig.PreferRuntimePlayers);
 		gConfig.IncludeGameStatePlayers = ReadConfigBool("IncludeGameStatePlayers", gConfig.IncludeGameStatePlayers);
@@ -1622,6 +1734,14 @@ namespace
 
 		if (LoadedConfigVersion < kOverlayConfigVersion)
 			ResetMainOverlayTargetingDefaults(gConfig);
+		if (LoadedConfigVersion < 3)
+			ResetFastOverlayCadenceDefaults(gConfig);
+		if (LoadedConfigVersion < 4)
+			ResetLifeStateDefaults(gConfig);
+		if (LoadedConfigVersion < 5)
+			ResetRendererSafetyDefaults(gConfig);
+		if (LoadedConfigVersion < 6)
+			ResetActorCaptureSafetyDefaults(gConfig);
 		EnsureRuntimeTokenDefaults(gConfig);
 	}
 
@@ -1632,6 +1752,7 @@ namespace
 		const OverlayConfig Config = GetConfigSnapshot();
 		WriteConfigInt("ConfigVersion", kOverlayConfigVersion);
 		WriteConfigBool("Enabled", Config.Enabled);
+		WriteConfigBool("ActorCaptureEnabled", Config.ActorCaptureEnabled);
 		WriteConfigBool("DrawLines", Config.DrawLines);
 		WriteConfigBool("DrawBoxes", Config.DrawBoxes);
 		WriteConfigBool("DrawNames", Config.DrawNames);
@@ -1646,10 +1767,11 @@ namespace
 		WriteConfigBool("UseReflectedPositionFallback", Config.UseReflectedPositionFallback);
 		WriteConfigBool("CaptureOnRenderFrame", Config.CaptureOnRenderFrame);
 		WriteConfigBool("OnlyOnScreen", Config.OnlyOnScreen);
-		WriteConfigBool("OnlyWithLocation", Config.OnlyWithLocation);
-		WriteConfigBool("OnlyInView", Config.OnlyInView);
-		WriteConfigBool("ExternalOverlayOnStreamline", Config.ExternalOverlayOnStreamline);
-		WriteConfigBool("UseProjectionFallback", Config.UseProjectionFallback);
+	WriteConfigBool("OnlyWithLocation", Config.OnlyWithLocation);
+	WriteConfigBool("OnlyInView", Config.OnlyInView);
+	WriteConfigBool("ExternalOverlayOnStreamline", Config.ExternalOverlayOnStreamline);
+	WriteConfigBool("ExternalOverlayOnD3D12", Config.ExternalOverlayOnD3D12);
+	WriteConfigBool("UseProjectionFallback", Config.UseProjectionFallback);
 	WriteConfigBool("ClampLargeBoxes", Config.ClampLargeBoxes);
 	WriteConfigBool("HideEnvironmentActors", Config.HideEnvironmentActors);
 	WriteConfigBool("HideLocalPlayer", Config.HideLocalPlayer);
@@ -1662,6 +1784,7 @@ namespace
 	WriteConfigBool("HideWeapons", Config.HideWeapons);
 	WriteConfigBool("HideVehicles", Config.HideVehicles);
 	WriteConfigBool("HideObjectives", Config.HideObjectives);
+	WriteConfigBool("HideDeadActors", Config.HideDeadActors);
 	WriteConfigBool("UseRuntimePlayerContext", Config.UseRuntimePlayerContext);
 	WriteConfigBool("PreferRuntimePlayers", Config.PreferRuntimePlayers);
 	WriteConfigBool("IncludeGameStatePlayers", Config.IncludeGameStatePlayers);
@@ -2889,8 +3012,57 @@ namespace
 		if (!Pointer || Size == 0)
 			return false;
 
-		const auto* Bytes = static_cast<const uint8*>(Pointer);
-		return IsReadablePointer(Bytes) && IsReadablePointer(Bytes + Size - 1);
+		const uintptr_t Begin = reinterpret_cast<uintptr_t>(Pointer);
+		const uintptr_t End = Begin + Size - 1;
+		if (End < Begin)
+			return false;
+
+		return IsReadablePointer(reinterpret_cast<const void*>(Begin))
+			&& IsReadablePointer(reinterpret_cast<const void*>(End));
+	}
+
+	bool TryReadMemory(const void* Source, void* Destination, size_t Size)
+	{
+		if (!Destination || !IsReadableRange(Source, Size))
+			return false;
+
+		__try
+		{
+			std::memcpy(Destination, Source, Size);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	bool TryWriteMemory(void* Destination, const void* Source, size_t Size)
+	{
+		if (!Destination || !Source || Size == 0 || !IsReadableRange(Destination, Size))
+			return false;
+
+		__try
+		{
+			std::memcpy(Destination, Source, Size);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	template<typename T>
+	bool TryReadValue(const void* Source, T& OutValue)
+	{
+		return TryReadMemory(Source, &OutValue, sizeof(T));
+	}
+
+	template<typename T>
+	bool TryWriteValue(void* Destination, const T& Value)
+	{
+		return TryWriteMemory(Destination, &Value, sizeof(T));
 	}
 
 	bool IsReadableObject(void* Pointer)
@@ -2898,7 +3070,10 @@ namespace
 		if (!IsReadablePointer(Pointer))
 			return false;
 
-		void* Vft = *reinterpret_cast<void**>(Pointer);
+		void* Vft = nullptr;
+		if (!TryReadValue(Pointer, Vft))
+			return false;
+
 		return IsReadablePointer(Vft);
 	}
 
@@ -2931,7 +3106,10 @@ namespace
 		if (!IsReadablePointer(Address))
 			return false;
 
-		void* ObjectPointer = *reinterpret_cast<void**>(Address);
+		void* ObjectPointer = nullptr;
+		if (!TryReadValue(Address, ObjectPointer))
+			return false;
+
 		if (!IsReadableObject(ObjectPointer))
 			return false;
 
@@ -2948,8 +3126,8 @@ namespace
 		if (!IsReadablePointer(Address))
 			return false;
 
-		*reinterpret_cast<void**>(Address) = Value.GetAddress();
-		return true;
+		void* RawValue = Value.GetAddress();
+		return TryWriteValue(Address, RawValue);
 	}
 
 	bool ReadBoxSphereBoundsProperty(UEObject Object, UEProperty Property, Vec3& OutOrigin, Vec3& OutExtent, float& OutSphereRadius)
@@ -2976,7 +3154,10 @@ namespace
 
 		if (Size >= static_cast<int32>(sizeof(double) * 7))
 		{
-			const double* Values = reinterpret_cast<const double*>(Data);
+			std::array<double, 7> Values{};
+			if (!TryReadMemory(Data, Values.data(), sizeof(double) * Values.size()))
+				return false;
+
 			OutOrigin = { Values[0], Values[1], Values[2] };
 			OutExtent = { Values[3], Values[4], Values[5] };
 			OutSphereRadius = static_cast<float>(Values[6]);
@@ -2985,16 +3166,26 @@ namespace
 
 		if (Size >= static_cast<int32>((sizeof(double) * 6) + sizeof(float)))
 		{
-			const double* Values = reinterpret_cast<const double*>(Data);
+			std::array<double, 6> Values{};
+			float Radius = 0.0f;
+			if (!TryReadMemory(Data, Values.data(), sizeof(double) * Values.size())
+				|| !TryReadValue(Data + (sizeof(double) * Values.size()), Radius))
+			{
+				return false;
+			}
+
 			OutOrigin = { Values[0], Values[1], Values[2] };
 			OutExtent = { Values[3], Values[4], Values[5] };
-			OutSphereRadius = *reinterpret_cast<const float*>(Data + (sizeof(double) * 6));
+			OutSphereRadius = Radius;
 			return IsUsefulBounds(OutOrigin, OutExtent, OutSphereRadius);
 		}
 
 		if (Size >= static_cast<int32>((sizeof(float) * 6) + sizeof(float)))
 		{
-			const float* Values = reinterpret_cast<const float*>(Data);
+			std::array<float, 7> Values{};
+			if (!TryReadMemory(Data, Values.data(), sizeof(float) * Values.size()))
+				return false;
+
 			OutOrigin = { Values[0], Values[1], Values[2] };
 			OutExtent = { Values[3], Values[4], Values[5] };
 			OutSphereRadius = Values[6];
@@ -3189,14 +3380,20 @@ namespace
 
 		if (Size >= static_cast<int32>(sizeof(double) * 3))
 		{
-			const double* Values = reinterpret_cast<const double*>(Data);
+			std::array<double, 3> Values{};
+			if (!TryReadMemory(Data, Values.data(), sizeof(double) * Values.size()))
+				return false;
+
 			OutValue = { Values[0], Values[1], Values[2] };
 			return IsSaneWorldPosition(OutValue);
 		}
 
 		if (Size >= static_cast<int32>(sizeof(float) * 3))
 		{
-			const float* Values = reinterpret_cast<const float*>(Data);
+			std::array<float, 3> Values{};
+			if (!TryReadMemory(Data, Values.data(), sizeof(float) * Values.size()))
+				return false;
+
 			OutValue = { Values[0], Values[1], Values[2] };
 			return IsSaneWorldPosition(OutValue);
 		}
@@ -3341,13 +3538,26 @@ namespace
 		return Plan;
 	}
 
-	void CollectReflectedPositionCandidates(UEObject Object, const OverlayConfig& Config, std::vector<PositionCandidate>& Candidates, CaptureStats* Stats = nullptr)
+	bool TryGetExistingPositionProbePlan(UEClass Class, const OverlayConfig& Config, CachedPositionProbePlan& OutPlan, CaptureStats* Stats)
 	{
-		if (!Config.UseReflectedPositionFallback || !Object)
-			return;
+		if (!Class)
+			return false;
 
-		UEClass Class = Object.GetClass();
-		const CachedPositionProbePlan Plan = GetCachedPositionProbePlan(Class, Config, Stats);
+		const uintptr_t ClassAddress = reinterpret_cast<uintptr_t>(Class.GetAddress());
+		const std::string Signature = PositionProbeSignature(Config);
+		std::scoped_lock Lock(gPositionProbeCacheMutex);
+		auto It = gPositionProbeCache.find(ClassAddress);
+		if (It == gPositionProbeCache.end() || It->second.Signature != Signature)
+			return false;
+
+		if (Stats)
+			Stats->PositionProbeCacheHits++;
+		OutPlan = It->second;
+		return true;
+	}
+
+	void CollectPositionCandidatesFromPlan(UEObject Object, const CachedPositionProbePlan& Plan, std::vector<PositionCandidate>& Candidates)
+	{
 		for (const CachedPositionProbe& Probe : Plan.Probes)
 		{
 			if (Probe.Kind == PositionProbeKind::VectorProperty)
@@ -3373,6 +3583,563 @@ namespace
 					AddPositionCandidate(Candidates, Value, Probe.Source);
 			}
 		}
+	}
+
+	void CollectReflectedPositionCandidates(UEObject Object, const OverlayConfig& Config, std::vector<PositionCandidate>& Candidates, CaptureStats* Stats = nullptr)
+	{
+		if (!Config.UseReflectedPositionFallback || !Object)
+			return;
+
+		UEClass Class = Object.GetClass();
+		const CachedPositionProbePlan Plan = GetCachedPositionProbePlan(Class, Config, Stats);
+		CollectPositionCandidatesFromPlan(Object, Plan, Candidates);
+	}
+
+	std::string CondenseIdentifier(std::string Text)
+	{
+		Text = ToLower(std::move(Text));
+		std::string Result;
+		Result.reserve(Text.size());
+		for (unsigned char Ch : Text)
+		{
+			if (std::isalnum(Ch))
+				Result.push_back(static_cast<char>(Ch));
+		}
+
+		return Result;
+	}
+
+	bool IsPotentiallyDeadBoolName(const std::string& CompactName)
+	{
+		if (CompactName.find("deadzone") != std::string::npos)
+			return false;
+
+		return CompactName == "dead"
+			|| CompactName == "bdead"
+			|| CompactName == "died"
+			|| CompactName == "bdied"
+			|| CompactName == "isdead"
+			|| CompactName == "bisdead"
+			|| CompactName == "isdying"
+			|| CompactName == "bisdying"
+			|| CompactName == "isknocked"
+			|| CompactName == "bisknocked"
+			|| CompactName == "isknockeddown"
+			|| CompactName == "bisknockeddown"
+			|| CompactName == "isdowned"
+			|| CompactName == "bisdowned"
+			|| CompactName.find("isdead") != std::string::npos
+			|| CompactName.find("isdying") != std::string::npos
+			|| CompactName.find("knockeddown") != std::string::npos
+			|| CompactName.find("downed") != std::string::npos;
+	}
+
+	bool IsPotentiallyAliveBoolName(const std::string& CompactName)
+	{
+		return CompactName == "alive"
+			|| CompactName == "balive"
+			|| CompactName == "isalive"
+			|| CompactName == "bisalive"
+			|| CompactName.find("isalive") != std::string::npos;
+	}
+
+	bool IsPotentiallyHealthName(const std::string& CompactName)
+	{
+		if (CompactName.find("max") != std::string::npos
+			|| CompactName.find("initial") != std::string::npos
+			|| CompactName.find("default") != std::string::npos
+			|| CompactName.find("starting") != std::string::npos
+			|| CompactName.find("start") != std::string::npos
+			|| CompactName.find("regen") != std::string::npos
+			|| CompactName.find("rate") != std::string::npos
+			|| CompactName.find("delta") != std::string::npos
+			|| CompactName.find("damage") != std::string::npos
+			|| CompactName.find("bar") != std::string::npos)
+		{
+			return false;
+		}
+
+		return CompactName == "health"
+			|| CompactName == "currenthealth"
+			|| CompactName == "hp"
+			|| CompactName == "currenthp"
+			|| CompactName == "hitpoints"
+			|| CompactName == "currenthitpoints"
+			|| CompactName == "life"
+			|| CompactName == "lives"
+			|| CompactName.find("currenthealth") != std::string::npos
+			|| CompactName.find("healthcurrent") != std::string::npos;
+	}
+
+	bool IsNumericProperty(const UEProperty& Property)
+	{
+		return Property
+			&& (Property.IsA(EClassCastFlags::FloatProperty)
+				|| Property.IsA(EClassCastFlags::DoubleProperty)
+				|| Property.IsA(EClassCastFlags::Int8Property)
+				|| Property.IsA(EClassCastFlags::Int16Property)
+				|| Property.IsA(EClassCastFlags::IntProperty)
+				|| Property.IsA(EClassCastFlags::Int64Property)
+				|| Property.IsA(EClassCastFlags::UInt16Property)
+				|| Property.IsA(EClassCastFlags::UInt32Property)
+				|| Property.IsA(EClassCastFlags::UInt64Property)
+				|| Property.IsA(EClassCastFlags::ByteProperty));
+	}
+
+	bool ReadBoolPropertyValue(UEObject Object, UEProperty Property, bool& OutValue)
+	{
+		if (!Object || !Property)
+			return false;
+
+		const int32 Offset = Property.GetOffset();
+		if (Offset < 0)
+			return false;
+
+		const uint8* Base = static_cast<const uint8*>(Object.GetAddress());
+		if (!Property.IsA(EClassCastFlags::BoolProperty))
+		{
+			uint8 Raw = 0;
+			if (!TryReadValue(Base + Offset, Raw))
+				return false;
+
+			OutValue = Raw != 0;
+			return true;
+		}
+
+		UEBoolProperty BoolProperty = Property.Cast<UEBoolProperty>();
+		if (BoolProperty.IsNativeBool())
+		{
+			uint8 Raw = 0;
+			if (!TryReadValue(Base + Offset, Raw))
+				return false;
+
+			OutValue = Raw != 0;
+			return true;
+		}
+
+		const size_t ByteIndex = static_cast<size_t>(Offset + BoolProperty.GetByteOffset());
+		uint8 Raw = 0;
+		if (!TryReadValue(Base + ByteIndex, Raw))
+			return false;
+
+		OutValue = (Raw & BoolProperty.GetFieldMask()) != 0;
+		return true;
+	}
+
+	bool ReadNumericPropertyValue(UEObject Object, UEProperty Property, double& OutValue)
+	{
+		if (!Object || !IsNumericProperty(Property))
+			return false;
+
+		const int32 Offset = Property.GetOffset();
+		const int32 Size = Property.GetSize();
+		if (Offset < 0 || Size <= 0)
+			return false;
+
+		const uint8* Data = static_cast<const uint8*>(Object.GetAddress()) + Offset;
+		if (Property.IsA(EClassCastFlags::DoubleProperty))
+		{
+			double Value = 0.0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = Value;
+		}
+		else if (Property.IsA(EClassCastFlags::FloatProperty))
+		{
+			float Value = 0.0f;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = Value;
+		}
+		else if (Property.IsA(EClassCastFlags::UInt64Property))
+		{
+			uint64_t Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else if (Property.IsA(EClassCastFlags::Int64Property))
+		{
+			int64 Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else if (Property.IsA(EClassCastFlags::UInt32Property))
+		{
+			uint32_t Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else if (Size >= static_cast<int32>(sizeof(int32)))
+		{
+			int32 Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else if (Property.IsA(EClassCastFlags::UInt16Property))
+		{
+			uint16_t Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else if (Size >= static_cast<int32>(sizeof(int16)))
+		{
+			int16 Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else if (Property.IsA(EClassCastFlags::ByteProperty))
+		{
+			uint8 Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+		else
+		{
+			int8 Value = 0;
+			if (!TryReadValue(Data, Value))
+				return false;
+
+			OutValue = static_cast<double>(Value);
+		}
+
+		return std::isfinite(OutValue) && std::abs(OutValue) < 10000000.0;
+	}
+
+	bool FunctionHasNoInputsWithReturn(const UEFunction& Function, UEProperty& OutReturn)
+	{
+		if (!Function)
+			return false;
+
+		int InputParams = 0;
+		OutReturn = Function.GetReturnProperty();
+		for (const UEProperty& Property : Function.GetProperties())
+		{
+			if (!Property.HasPropertyFlags(EPropertyFlags::Parm))
+				continue;
+
+			if (Property.HasPropertyFlags(EPropertyFlags::ReturnParm))
+				OutReturn = Property;
+			else
+				InputParams++;
+		}
+
+		return InputParams == 0 && static_cast<bool>(OutReturn);
+	}
+
+	CachedLifeStateProbePlan BuildLifeStateProbePlan(UEClass Class)
+	{
+		CachedLifeStateProbePlan Plan;
+		Plan.Built = true;
+		Plan.BuiltTick = GetTickCount();
+
+		int InspectedFields = 0;
+		for (UEStruct Struct = Class; Struct && InspectedFields < 220; Struct = Struct.GetSuper())
+		{
+			const std::string StructName = Struct.GetName();
+			for (const UEProperty& Property : Struct.GetProperties())
+			{
+				if (++InspectedFields > 220)
+					break;
+
+				const std::string CompactName = CondenseIdentifier(Property.GetName());
+				const std::string Source = StructName + "." + Property.GetName();
+				if (Property.IsA(EClassCastFlags::BoolProperty))
+				{
+					if (IsPotentiallyDeadBoolName(CompactName))
+						Plan.Probes.push_back({ LifeStateProbeKind::DeadBoolProperty, Property, {}, Source });
+					else if (IsPotentiallyAliveBoolName(CompactName))
+						Plan.Probes.push_back({ LifeStateProbeKind::AliveBoolProperty, Property, {}, Source });
+				}
+				else if (IsNumericProperty(Property) && IsPotentiallyHealthName(CompactName))
+				{
+					Plan.Probes.push_back({ LifeStateProbeKind::HealthNumberProperty, Property, {}, Source });
+				}
+			}
+
+			for (const UEFunction& Function : Struct.GetFunctions())
+			{
+				if (++InspectedFields > 220)
+					break;
+
+				UEProperty ReturnProperty;
+				if (!FunctionHasNoInputsWithReturn(Function, ReturnProperty))
+					continue;
+
+				const std::string CompactName = CondenseIdentifier(Function.GetName());
+				const std::string Source = StructName + "." + Function.GetName() + "()";
+				if (ReturnProperty.IsA(EClassCastFlags::BoolProperty))
+				{
+					if (IsPotentiallyDeadBoolName(CompactName))
+						Plan.Probes.push_back({ LifeStateProbeKind::DeadBoolFunction, {}, Function, Source });
+					else if (IsPotentiallyAliveBoolName(CompactName))
+						Plan.Probes.push_back({ LifeStateProbeKind::AliveBoolFunction, {}, Function, Source });
+				}
+				else if (IsNumericProperty(ReturnProperty) && IsPotentiallyHealthName(CompactName))
+				{
+					Plan.Probes.push_back({ LifeStateProbeKind::HealthNumberFunction, {}, Function, Source });
+				}
+			}
+		}
+
+		return Plan;
+	}
+
+	CachedLifeStateProbePlan GetCachedLifeStateProbePlan(UEClass Class, CaptureStats* Stats)
+	{
+		if (!Class)
+			return {};
+
+		const uintptr_t ClassAddress = reinterpret_cast<uintptr_t>(Class.GetAddress());
+		{
+			std::scoped_lock Lock(gLifeStateProbeCacheMutex);
+			auto It = gLifeStateProbeCache.find(ClassAddress);
+			if (It != gLifeStateProbeCache.end() && It->second.Built)
+			{
+				if (Stats)
+					Stats->LifeStateProbeCacheHits++;
+				return It->second;
+			}
+		}
+
+		if (Stats)
+			Stats->LifeStateProbeCacheMisses++;
+
+		CachedLifeStateProbePlan Plan = BuildLifeStateProbePlan(Class);
+		{
+			std::scoped_lock Lock(gLifeStateProbeCacheMutex);
+			gLifeStateProbeCache[ClassAddress] = Plan;
+		}
+
+		return Plan;
+	}
+
+	bool CallNoArgBoolFunction(UEObject Object, UEFunction Function, bool& OutValue)
+	{
+		if (!Object || !Function)
+			return false;
+
+		UEProperty ReturnProperty = Function.GetReturnProperty();
+		if (!ReturnProperty)
+			ReturnProperty = Function.FindMember("ReturnValue");
+		if (!ReturnProperty)
+			return false;
+
+		std::vector<uint8> Params = MakeParamBuffer(Function);
+		EnsureParamSize(Params, ReturnProperty);
+		if (!ProcessEventWithRuntimeFlags(Object, Function, Params.data()))
+			return false;
+
+		OutValue = ReadBool(Params, ReturnProperty, false);
+		return true;
+	}
+
+	bool CallNoArgNumberFunction(UEObject Object, UEFunction Function, double& OutValue)
+	{
+		if (!Object || !Function)
+			return false;
+
+		UEProperty ReturnProperty = Function.GetReturnProperty();
+		if (!ReturnProperty)
+			ReturnProperty = Function.FindMember("ReturnValue");
+		if (!ReturnProperty || !IsNumericProperty(ReturnProperty))
+			return false;
+
+		std::vector<uint8> Params = MakeParamBuffer(Function);
+		EnsureParamSize(Params, ReturnProperty);
+		if (!ProcessEventWithRuntimeFlags(Object, Function, Params.data()))
+			return false;
+
+		if (ReturnProperty.IsA(EClassCastFlags::FloatProperty) || ReturnProperty.IsA(EClassCastFlags::DoubleProperty))
+		{
+			float Value = 0.0f;
+			if (!ReadScalar(Params, ReturnProperty, Value))
+				return false;
+			OutValue = Value;
+		}
+		else
+		{
+			int64 Value = 0;
+			if (!ReadInteger(Params, ReturnProperty, Value))
+				return false;
+			OutValue = static_cast<double>(Value);
+		}
+
+		return std::isfinite(OutValue) && std::abs(OutValue) < 10000000.0;
+	}
+
+	bool TryResolveActorLifeState(UEObject Object, ActorDebugInfo& Info, CaptureStats& Stats)
+	{
+		if (!Object)
+			return false;
+
+		UEClass Class = Object.GetClass();
+		const CachedLifeStateProbePlan Plan = GetCachedLifeStateProbePlan(Class, &Stats);
+		bool HasAliveSignal = false;
+		std::string AliveSource;
+		double AliveHealth = 0.0;
+
+		for (const CachedLifeStateProbe& Probe : Plan.Probes)
+		{
+			switch (Probe.Kind)
+			{
+			case LifeStateProbeKind::DeadBoolProperty:
+			{
+				bool Value = false;
+				if (ReadBoolPropertyValue(Object, Probe.Property, Value))
+				{
+					if (Value)
+					{
+						Info.HasLifeState = true;
+						Info.IsDead = true;
+						Info.LifeStateSource = Probe.Source + " = true";
+						return true;
+					}
+
+					HasAliveSignal = true;
+					AliveSource = Probe.Source + " = false";
+				}
+				break;
+			}
+			case LifeStateProbeKind::AliveBoolProperty:
+			{
+				bool Value = true;
+				if (ReadBoolPropertyValue(Object, Probe.Property, Value))
+				{
+					if (!Value)
+					{
+						Info.HasLifeState = true;
+						Info.IsDead = true;
+						Info.LifeStateSource = Probe.Source + " = false";
+						return true;
+					}
+
+					HasAliveSignal = true;
+					AliveSource = Probe.Source + " = true";
+				}
+				break;
+			}
+			case LifeStateProbeKind::HealthNumberProperty:
+			{
+				double Value = 0.0;
+				if (ReadNumericPropertyValue(Object, Probe.Property, Value))
+				{
+					Info.HealthValue = static_cast<float>(Value);
+					if (Value <= 0.0)
+					{
+						Info.HasLifeState = true;
+						Info.IsDead = true;
+						Info.LifeStateSource = Probe.Source + " <= 0";
+						return true;
+					}
+
+					HasAliveSignal = true;
+					AliveSource = Probe.Source + " > 0";
+					AliveHealth = Value;
+				}
+				break;
+			}
+			case LifeStateProbeKind::DeadBoolFunction:
+			{
+				bool Value = false;
+				if (CallNoArgBoolFunction(Object, Probe.Function, Value))
+				{
+					if (Value)
+					{
+						Info.HasLifeState = true;
+						Info.IsDead = true;
+						Info.LifeStateSource = Probe.Source + " = true";
+						return true;
+					}
+
+					HasAliveSignal = true;
+					AliveSource = Probe.Source + " = false";
+				}
+				break;
+			}
+			case LifeStateProbeKind::AliveBoolFunction:
+			{
+				bool Value = true;
+				if (CallNoArgBoolFunction(Object, Probe.Function, Value))
+				{
+					if (!Value)
+					{
+						Info.HasLifeState = true;
+						Info.IsDead = true;
+						Info.LifeStateSource = Probe.Source + " = false";
+						return true;
+					}
+
+					HasAliveSignal = true;
+					AliveSource = Probe.Source + " = true";
+				}
+				break;
+			}
+			case LifeStateProbeKind::HealthNumberFunction:
+			{
+				double Value = 0.0;
+				if (CallNoArgNumberFunction(Object, Probe.Function, Value))
+				{
+					Info.HealthValue = static_cast<float>(Value);
+					if (Value <= 0.0)
+					{
+						Info.HasLifeState = true;
+						Info.IsDead = true;
+						Info.LifeStateSource = Probe.Source + " <= 0";
+						return true;
+					}
+
+					HasAliveSignal = true;
+					AliveSource = Probe.Source + " > 0";
+					AliveHealth = Value;
+				}
+				break;
+			}
+			default:
+				break;
+			}
+		}
+
+		if (HasAliveSignal)
+		{
+			Info.HasLifeState = true;
+			Info.IsDead = false;
+			Info.HealthValue = static_cast<float>(AliveHealth);
+			Info.LifeStateSource = std::move(AliveSource);
+			return true;
+		}
+
+		return false;
+	}
+
+	void UpdateActorLifeState(ActorDebugInfo& Info, UEObject Object, CaptureStats& Stats)
+	{
+		Info.HasLifeState = false;
+		Info.IsDead = false;
+		Info.HealthValue = 0.0f;
+		Info.LifeStateSource.clear();
+
+		if (!TryResolveActorLifeState(Object, Info, Stats))
+			return;
+
+		Stats.LifeStateActors++;
+		if (Info.IsDead)
+			Stats.DeadActors++;
 	}
 
 	bool IsSkinnedMeshComponent(UEObject Object)
@@ -3697,7 +4464,10 @@ namespace
 		if (!IsReadablePointer(Address))
 			return false;
 
-		const RawTArrayView Array = *reinterpret_cast<RawTArrayView*>(Address);
+		RawTArrayView Array{};
+		if (!TryReadValue(Address, Array))
+			return false;
+
 		if (Array.Num < 0 || Array.Max < Array.Num || Array.Num > 0x20000)
 			return false;
 
@@ -3899,7 +4669,10 @@ namespace
 		OutObjects.reserve(static_cast<size_t>(Count));
 		for (int32 Index = 0; Index < Count; ++Index)
 		{
-			void* Pointer = RawData[Index];
+			void* Pointer = nullptr;
+			if (!TryReadValue(&RawData[Index], Pointer))
+				continue;
+
 			if (IsReadableObject(Pointer))
 				OutObjects.emplace_back(Pointer);
 		}
@@ -3926,7 +4699,10 @@ namespace
 		OutObjects.reserve(static_cast<size_t>(Count));
 		for (int32 Index = 0; Index < Count; ++Index)
 		{
-			void* Pointer = RawData[Index];
+			void* Pointer = nullptr;
+			if (!TryReadValue(&RawData[Index], Pointer))
+				continue;
+
 			if (IsReadableObject(Pointer))
 				OutObjects.emplace_back(Pointer);
 		}
@@ -3947,7 +4723,10 @@ namespace
 		if (!IsReadablePointer(Address))
 			return false;
 
-		const RawTArrayView ActorArray = *reinterpret_cast<RawTArrayView*>(Address);
+		RawTArrayView ActorArray{};
+		if (!TryReadValue(Address, ActorArray))
+			return false;
+
 		if (ActorArray.Num < 0 || ActorArray.Max < ActorArray.Num || ActorArray.Num > 0x40000)
 			return false;
 
@@ -3959,7 +4738,10 @@ namespace
 		void** ActorData = static_cast<void**>(ActorArray.Data);
 		for (int32 Index = 0; Index < ActorArray.Num; ++Index)
 		{
-			void* ActorPointer = ActorData[Index];
+			void* ActorPointer = nullptr;
+			if (!TryReadValue(&ActorData[Index], ActorPointer))
+				continue;
+
 			if (IsReadableObject(ActorPointer))
 				OutActors.emplace_back(ActorPointer);
 		}
@@ -3981,11 +4763,60 @@ namespace
 		if (!IsReadablePointer(WorldAddress))
 			return {};
 
-		void* WorldPointer = *WorldAddress;
+		void* WorldPointer = nullptr;
+		if (!TryReadValue(WorldAddress, WorldPointer))
+			return {};
+
 		if (!IsReadableObject(WorldPointer))
 			return {};
 
 		return UEObject(WorldPointer);
+	}
+
+	void SetCapturePausedStatus(uintptr_t WorldAddress, const char* Reason)
+	{
+		CaptureStats Stats;
+		Stats.LastCaptureTick = GetTickCount();
+		Stats.WorldAddress = WorldAddress;
+		Stats.Status = Reason ? Reason : "Actor capture paused";
+
+		std::scoped_lock Lock(gActorMutex);
+		gActors.clear();
+		gFilteredActors.clear();
+		gStats = std::move(Stats);
+	}
+
+	bool ShouldPauseActorCaptureForWorldTransition(DWORD Now)
+	{
+		constexpr DWORD WorldChangePauseMs = 15000;
+		constexpr DWORD MissingWorldPauseMs = 1000;
+
+		UEObject World = ReadGWorldObject();
+		const uintptr_t WorldAddress = World ? reinterpret_cast<uintptr_t>(World.GetAddress()) : 0;
+		const uintptr_t PreviousWorldAddress = gLastCaptureWorldAddress.exchange(WorldAddress);
+
+		if (WorldAddress == 0)
+		{
+			gCapturePausedUntilTick.store(Now + MissingWorldPauseMs);
+			SetCapturePausedStatus(0, "Actor capture paused: waiting for world");
+			return true;
+		}
+
+		if (PreviousWorldAddress != WorldAddress)
+		{
+			gCapturePausedUntilTick.store(Now + WorldChangePauseMs);
+			SetCapturePausedStatus(WorldAddress, "Actor capture paused: world changed");
+			return true;
+		}
+
+		const DWORD PauseUntil = gCapturePausedUntilTick.load();
+		if (PauseUntil != 0 && Now < PauseUntil)
+		{
+			SetCapturePausedStatus(WorldAddress, "Actor capture paused: level transition settling");
+			return true;
+		}
+
+		return false;
 	}
 
 	bool GetActorLocation(UEObject Actor, Vec3& OutLocation, std::string* OutSource = nullptr)
@@ -4320,11 +5151,41 @@ namespace
 			return false;
 		}
 
-		uint32_t* FunctionFlags = reinterpret_cast<uint32_t*>(FlagsAddress);
-		const uint32_t PreviousFlags = *FunctionFlags;
-		*FunctionFlags = PreviousFlags | 0x400u;
-		Target.ProcessEvent(Function, Params);
-		*FunctionFlags = PreviousFlags;
+		uint32_t PreviousFlags = 0;
+		if (!TryReadValue(FlagsAddress, PreviousFlags))
+		{
+			if (OutFailure)
+				*OutFailure = "FunctionFlags read failed";
+			return false;
+		}
+
+		const uint32_t NativeFlags = PreviousFlags | 0x400u;
+		if (!TryWriteValue(FlagsAddress, NativeFlags))
+		{
+			if (OutFailure)
+				*OutFailure = "FunctionFlags write failed";
+			return false;
+		}
+
+		__try
+		{
+			Target.ProcessEvent(Function, Params);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			TryWriteValue(FlagsAddress, PreviousFlags);
+			if (OutFailure)
+				*OutFailure = "ProcessEvent raised an exception";
+			return false;
+		}
+
+		if (!TryWriteValue(FlagsAddress, PreviousFlags))
+		{
+			if (OutFailure)
+				*OutFailure = "FunctionFlags restore failed";
+			return false;
+		}
+
 		return true;
 	}
 
@@ -5058,6 +5919,9 @@ namespace
 		if (Config.HideLocalPlayer && Actor.IsLocalPlayer)
 			return ActorFilterReason::LocalPlayer;
 
+		if (Config.HideDeadActors && Actor.HasLifeState && Actor.IsDead)
+			return ActorFilterReason::Dead;
+
 		if (Config.ClassExcludeFilter[0] != '\0' && ActorClassMatchesTokens(Actor, Config.ClassExcludeFilter))
 			return ActorFilterReason::ClassExcludeFilter;
 
@@ -5285,6 +6149,9 @@ namespace
 			break;
 		case ActorFilterReason::Objective:
 			Stats.FilteredObjective++;
+			break;
+		case ActorFilterReason::Dead:
+			Stats.FilteredDead++;
 			break;
 		case ActorFilterReason::ClassFilter:
 			Stats.FilteredClass++;
@@ -5916,6 +6783,7 @@ namespace
 			Info.IsObjective = IsObjectiveLikeActor(Info, Config);
 			UpdateLikelyPlayerScore(Info, Config);
 			Info.IsEnvironment = IsEnvironmentLikeActor(Info, Config);
+			UpdateActorLifeState(Info, Object, Stats);
 
 			if (Info.IsBot)
 				Stats.BotActors++;
@@ -6087,31 +6955,122 @@ namespace
 
 	void CaptureActorsForRenderFrame(const OverlayConfig& Config);
 
+	void CaptureThreadProcImpl()
+	{
+		try
+		{
+			DWORD LastDiscoveryTick = 0;
+
+			while (gRunning && gCaptureThreadRequested.load())
+			{
+				const OverlayConfig Config = GetConfigSnapshot();
+				if (!Config.ActorCaptureEnabled)
+				{
+					gCaptureThreadRequested.store(false);
+					break;
+				}
+
+				const DWORD Now = GetTickCount();
+				const int DiscoveryMs = std::clamp(Config.RefreshMs, 250, 10000);
+
+				if (ShouldPauseActorCaptureForWorldTransition(Now))
+				{
+					Sleep(std::clamp(Config.FrameCaptureMinMs, 16, 250));
+					continue;
+				}
+
+				if (LastDiscoveryTick == 0 || Now - LastDiscoveryTick >= static_cast<DWORD>(DiscoveryMs))
+				{
+					if (CaptureActors(false))
+						LastDiscoveryTick = Now;
+				}
+				else
+				{
+					CaptureActorsForRenderFrame(Config);
+				}
+
+				const int SleepMs = Config.FastOverlayMode
+					? std::clamp(Config.FrameCaptureMinMs, 8, 100)
+					: 25;
+				Sleep(SleepMs);
+			}
+		}
+		catch (const std::exception& Exception)
+		{
+			LogOverlayRuntimeError("capture thread", Exception.what());
+			SetStatus("Overlay capture stopped after exception");
+			gCaptureThreadRequested.store(false);
+		}
+		catch (...)
+		{
+			LogOverlayRuntimeError("capture thread", "unknown exception");
+			SetStatus("Overlay capture stopped after unknown exception");
+			gCaptureThreadRequested.store(false);
+		}
+	}
+
 	void CaptureThreadProc()
 	{
-		DWORD LastDiscoveryTick = 0;
-
-		while (gRunning)
+		gCaptureThreadLive.store(true);
+		__try
 		{
-			const OverlayConfig Config = GetConfigSnapshot();
-			const DWORD Now = GetTickCount();
-			const int DiscoveryMs = std::clamp(Config.RefreshMs, 250, 10000);
-
-			if (LastDiscoveryTick == 0 || Now - LastDiscoveryTick >= static_cast<DWORD>(DiscoveryMs))
-			{
-				if (CaptureActors(false))
-					LastDiscoveryTick = Now;
-			}
-			else
-			{
-				CaptureActorsForRenderFrame(Config);
-			}
-
-			const int SleepMs = Config.FastOverlayMode
-				? std::clamp(Config.FrameCaptureMinMs, 8, 100)
-				: 25;
-			Sleep(SleepMs);
+			CaptureThreadProcImpl();
 		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			LogOverlayStructuredException("capture thread", GetExceptionCode());
+			gCaptureThreadRequested.store(false);
+		}
+		gCaptureThreadLive.store(false);
+	}
+
+	void ApplyActorCaptureThreadState(bool bShouldRun, bool bWaitForStop)
+	{
+		std::scoped_lock ThreadLock(gCaptureThreadStateMutex);
+
+		if (gCaptureThread.joinable() && !gCaptureThreadLive.load())
+			gCaptureThread.join();
+
+		if (bShouldRun)
+		{
+			gCaptureThreadRequested.store(true);
+
+			if (gCaptureThread.joinable())
+			{
+				SetStatus("Actor capture running");
+				return;
+			}
+
+			try
+			{
+				gCaptureThreadLive.store(true);
+				gCaptureThread = std::thread(CaptureThreadProc);
+				std::cerr << "[Overlay] Background capture started\n";
+				SetStatus("Actor capture running");
+			}
+			catch (const std::exception& Exception)
+			{
+				gCaptureThreadRequested.store(false);
+				gCaptureThreadLive.store(false);
+				LogOverlayRuntimeError("capture thread start", Exception.what());
+				SetStatus("Failed to start actor capture");
+			}
+			catch (...)
+			{
+				gCaptureThreadRequested.store(false);
+				gCaptureThreadLive.store(false);
+				LogOverlayRuntimeError("capture thread start", "unknown exception");
+				SetStatus("Failed to start actor capture");
+			}
+			return;
+		}
+
+		gCaptureThreadRequested.store(false);
+
+		if (bWaitForStop && gCaptureThread.joinable() && gCaptureThread.get_id() != std::this_thread::get_id())
+			gCaptureThread.join();
+
+		SetStatus("Actor capture stopped");
 	}
 
 	RenderBackend DetectRendererBackend()
@@ -6304,6 +7263,9 @@ namespace
 		return true;
 	}
 
+	HWND FindMainProcessWindow();
+	void FocusWindowBestEffort(HWND Window);
+
 	LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
 	{
 		if ((Msg == WM_KEYDOWN || Msg == WM_SYSKEYDOWN) && wParam == VK_F2 && (lParam & (1L << 30)) == 0)
@@ -6321,26 +7283,84 @@ namespace
 		return CallWindowProc(gOriginalWndProc, hWnd, Msg, wParam, lParam);
 	}
 
+	bool IsOverlayMouseMessage(UINT Msg)
+	{
+		switch (Msg)
+		{
+		case WM_MOUSEMOVE:
+		case WM_LBUTTONDOWN:
+		case WM_LBUTTONUP:
+		case WM_LBUTTONDBLCLK:
+		case WM_RBUTTONDOWN:
+		case WM_RBUTTONUP:
+		case WM_RBUTTONDBLCLK:
+		case WM_MBUTTONDOWN:
+		case WM_MBUTTONUP:
+		case WM_MBUTTONDBLCLK:
+		case WM_XBUTTONDOWN:
+		case WM_XBUTTONUP:
+		case WM_XBUTTONDBLCLK:
+		case WM_MOUSEWHEEL:
+		case WM_MOUSEHWHEEL:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	LPARAM TranslateOverlayMouseLParam(HWND SourceWindow, HWND TargetWindow, UINT Msg, LPARAM lParam)
+	{
+		if (Msg == WM_MOUSEWHEEL || Msg == WM_MOUSEHWHEEL)
+			return lParam;
+
+		POINT Point = { static_cast<SHORT>(LOWORD(lParam)), static_cast<SHORT>(HIWORD(lParam)) };
+		ClientToScreen(SourceWindow, &Point);
+		ScreenToClient(TargetWindow, &Point);
+		return MAKELPARAM(static_cast<SHORT>(Point.x), static_cast<SHORT>(Point.y));
+	}
+
+	bool ForwardOverlayMouseToTarget(HWND SourceWindow, UINT Msg, WPARAM wParam, LPARAM lParam)
+	{
+		if (!gTargetWindow || !IsWindow(gTargetWindow))
+			gTargetWindow = FindMainProcessWindow();
+
+		if (!gTargetWindow)
+			return false;
+
+		const LPARAM TargetLParam = TranslateOverlayMouseLParam(SourceWindow, gTargetWindow, Msg, lParam);
+
+		if (Msg == WM_LBUTTONDOWN || Msg == WM_RBUTTONDOWN || Msg == WM_MBUTTONDOWN || Msg == WM_XBUTTONDOWN)
+			FocusWindowBestEffort(gTargetWindow);
+
+		return PostMessageA(gTargetWindow, Msg, wParam, TargetLParam) != FALSE;
+	}
+
 	LRESULT CALLBACK ExternalOverlayWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
 	{
+		const bool PassThrough = !gMenuOpen || gExternalInputPassthrough.load();
+
 		if ((Msg == WM_KEYDOWN || Msg == WM_SYSKEYDOWN) && wParam == VK_F2 && (lParam & (1L << 30)) == 0)
 		{
-			const bool PassThrough = !gMenuOpen || gExternalInputPassthrough.load();
 			TriggerUnrealConsoleHotkey();
 			if (!PassThrough && PostConsoleKeyToTargetWindow())
 				std::cerr << "[Overlay] Console F2 posted to target window\n";
 			return 0;
 		}
 
-		if (gMenuOpen && ImGui_ImplWin32_WndProcHandler(hWnd, Msg, wParam, lParam))
-			return true;
-
-		const bool PassThrough = !gMenuOpen || gExternalInputPassthrough.load();
 		if (Msg == WM_MOUSEACTIVATE && PassThrough)
 			return MA_NOACTIVATE;
 
 		if (Msg == WM_NCHITTEST && PassThrough)
-			return HTTRANSPARENT;
+			return HTCLIENT;
+
+		if (PassThrough && IsOverlayMouseMessage(Msg))
+		{
+			ForwardOverlayMouseToTarget(hWnd, Msg, wParam, lParam);
+			return 0;
+		}
+
+		if (!PassThrough && gMenuOpen && ImGui_ImplWin32_WndProcHandler(hWnd, Msg, wParam, lParam))
+			return true;
 
 		if (Msg == WM_DESTROY)
 			return 0;
@@ -6515,13 +7535,14 @@ namespace
 
 		LONG_PTR Style = GetWindowLongPtr(gExternalWindow, GWL_EXSTYLE);
 		if (PassThrough)
-			Style |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+			Style |= WS_EX_NOACTIVATE;
 		else
 			Style &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
 
 		SetWindowLongPtr(gExternalWindow, GWL_EXSTYLE, Style);
 		const UINT Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | (PassThrough ? SWP_NOACTIVATE : 0);
 		SetWindowPos(gExternalWindow, HWND_TOPMOST, 0, 0, 0, 0, Flags);
+		ShowWindow(gExternalWindow, PassThrough ? SW_SHOWNOACTIVATE : SW_SHOW);
 
 		if (PassThrough)
 			FocusWindowBestEffort(gTargetWindow);
@@ -6684,6 +7705,11 @@ namespace
 		Stats.FallbackProjectionFailures = 0;
 		Stats.InViewActors = 0;
 		Stats.BoxedActors = 0;
+		Stats.LifeStateActors = 0;
+		Stats.DeadActors = 0;
+		Stats.FilteredDead = 0;
+		Stats.LifeStateProbeCacheHits = 0;
+		Stats.LifeStateProbeCacheMisses = 0;
 		Stats.SkeletonActors = 0;
 		Stats.SkeletonBones = 0;
 		Stats.SkeletonSegments = 0;
@@ -6729,6 +7755,16 @@ namespace
 			ProcessedActors++;
 			ApplyRuntimePlayerContext(Info, Object, RuntimeContext, Stats);
 			UpdateLikelyPlayerScore(Info, Config);
+			UpdateActorLifeState(Info, Object, Stats);
+			if (Config.HideDeadActors && Info.HasLifeState && Info.IsDead)
+			{
+				Info.FilterReason = ActorFilterReason::Dead;
+				CountFilteredActor(Stats, ActorFilterReason::Dead);
+				Info.HasScreen = false;
+				Info.HasBox = false;
+				Info.HasSkeleton = false;
+				continue;
+			}
 
 			const Vec3 PreviousLocation = Info.Location;
 			std::vector<PositionCandidate> PositionCandidates;
@@ -6740,13 +7776,25 @@ namespace
 			}
 			else if (Config.UseReflectedPositionFallback)
 			{
+				const size_t BeforeCachedPlan = PositionCandidates.size();
+				CachedPositionProbePlan CachedPlan;
+				if (TryGetExistingPositionProbePlan(Object.GetClass(), Config, CachedPlan, &Stats))
+				{
+					CollectPositionCandidatesFromPlan(Object, CachedPlan, PositionCandidates);
+					if (PositionCandidates.size() > BeforeCachedPlan)
+					{
+						Info.LastReflectedPositionTick = Now;
+						Stats.ReflectedPositionHits++;
+					}
+				}
+
 				const DWORD ReflectionDelay = static_cast<DWORD>(std::clamp(Config.ReflectedPositionRefreshMs, 0, 1000));
 				const bool CanRefreshReflection = !Config.ThrottleLiveReflectionFallback
-					|| Info.LastReflectedPositionTick == 0
+					|| (Info.LastReflectedPositionTick == 0 && PositionCandidates.empty())
 					|| ReflectionDelay == 0
-					|| Now - Info.LastReflectedPositionTick >= ReflectionDelay;
+					|| (PositionCandidates.empty() && Now - Info.LastReflectedPositionTick >= ReflectionDelay);
 
-				if (CanRefreshReflection)
+				if (PositionCandidates.empty() && CanRefreshReflection)
 				{
 					const size_t BeforeReflection = PositionCandidates.size();
 					CollectReflectedPositionCandidates(Object, Config, PositionCandidates, &Stats);
@@ -6872,6 +7920,14 @@ namespace
 			{
 				Info.HasSkeleton = false;
 			}
+		}
+
+		if (Config.HideDeadActors)
+		{
+			Actors.erase(std::remove_if(Actors.begin(), Actors.end(), [](const ActorDebugInfo& Info)
+			{
+				return Info.HasLifeState && Info.IsDead;
+			}), Actors.end());
 		}
 
 		Stats.FrameProcessedActors = ProcessedActors;
@@ -7317,7 +8373,7 @@ namespace
 		const int Height = TargetRect.bottom - TargetRect.top;
 		DWORD ExternalStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
 		if (ExternalShouldPassThrough())
-			ExternalStyle |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+			ExternalStyle |= WS_EX_NOACTIVATE;
 
 		gExternalWindow = CreateWindowExA(
 			ExternalStyle,
@@ -7359,60 +8415,88 @@ namespace
 		return true;
 	}
 
+	void ExternalOverlayRenderLoopImpl()
+	{
+		try
+		{
+			if (!InitializeExternalOverlay())
+			{
+				SetStatus("Failed to initialize external overlay");
+				gRunning = false;
+				return;
+			}
+
+			while (gRunning)
+			{
+				MSG Message = {};
+				while (PeekMessage(&Message, gExternalWindow, 0, 0, PM_REMOVE))
+				{
+					TranslateMessage(&Message);
+					DispatchMessage(&Message);
+				}
+
+				RECT TargetRect = {};
+				if (GetTargetClientRect(TargetRect))
+				{
+					const int Width = TargetRect.right - TargetRect.left;
+					const int Height = TargetRect.bottom - TargetRect.top;
+					RECT OverlayRect = {};
+					GetWindowRect(gExternalWindow, &OverlayRect);
+
+					if (OverlayRect.left != TargetRect.left || OverlayRect.top != TargetRect.top
+						|| (OverlayRect.right - OverlayRect.left) != Width
+						|| (OverlayRect.bottom - OverlayRect.top) != Height)
+					{
+						ReleaseExternalRenderTarget();
+						gExternalSwapChain->ResizeBuffers(0, static_cast<UINT>(Width), static_cast<UINT>(Height), DXGI_FORMAT_UNKNOWN, 0);
+						CreateExternalRenderTarget();
+						if (gCompositionDevice)
+							gCompositionDevice->Commit();
+						SetWindowPos(gExternalWindow, HWND_TOPMOST, TargetRect.left, TargetRect.top, Width, Height, SWP_NOACTIVATE);
+					}
+				}
+
+				ProcessOverlayHotkeys();
+				UpdateExternalClickThrough();
+
+				ImGui_ImplDX11_NewFrame();
+				ImGui_ImplWin32_NewFrame();
+				ImGui::NewFrame();
+				DrawOverlayUi();
+				ImGui::Render();
+
+				const float ClearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+				gExternalDeviceContext->OMSetRenderTargets(1, &gExternalRenderTargetView, nullptr);
+				gExternalDeviceContext->ClearRenderTargetView(gExternalRenderTargetView, ClearColor);
+				ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+				gExternalSwapChain->Present(0, 0);
+				Sleep(1);
+			}
+		}
+		catch (const std::exception& Exception)
+		{
+			LogOverlayRuntimeError("external overlay render thread", Exception.what());
+			SetStatus("External overlay stopped after exception");
+			gRunning = false;
+		}
+		catch (...)
+		{
+			LogOverlayRuntimeError("external overlay render thread", "unknown exception");
+			SetStatus("External overlay stopped after unknown exception");
+			gRunning = false;
+		}
+	}
+
 	void ExternalOverlayRenderLoop()
 	{
-		if (!InitializeExternalOverlay())
+		__try
 		{
-			SetStatus("Failed to initialize external overlay");
-			gRunning = false;
-			return;
+			ExternalOverlayRenderLoopImpl();
 		}
-
-		while (gRunning)
+		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
-			MSG Message = {};
-			while (PeekMessage(&Message, gExternalWindow, 0, 0, PM_REMOVE))
-			{
-				TranslateMessage(&Message);
-				DispatchMessage(&Message);
-			}
-
-			RECT TargetRect = {};
-			if (GetTargetClientRect(TargetRect))
-			{
-				const int Width = TargetRect.right - TargetRect.left;
-				const int Height = TargetRect.bottom - TargetRect.top;
-				RECT OverlayRect = {};
-				GetWindowRect(gExternalWindow, &OverlayRect);
-
-				if (OverlayRect.left != TargetRect.left || OverlayRect.top != TargetRect.top
-					|| (OverlayRect.right - OverlayRect.left) != Width
-					|| (OverlayRect.bottom - OverlayRect.top) != Height)
-				{
-					ReleaseExternalRenderTarget();
-					gExternalSwapChain->ResizeBuffers(0, static_cast<UINT>(Width), static_cast<UINT>(Height), DXGI_FORMAT_UNKNOWN, 0);
-					CreateExternalRenderTarget();
-					if (gCompositionDevice)
-						gCompositionDevice->Commit();
-					SetWindowPos(gExternalWindow, HWND_TOPMOST, TargetRect.left, TargetRect.top, Width, Height, SWP_NOACTIVATE);
-				}
-			}
-
-			ProcessOverlayHotkeys();
-			UpdateExternalClickThrough();
-
-			ImGui_ImplDX11_NewFrame();
-			ImGui_ImplWin32_NewFrame();
-			ImGui::NewFrame();
-			DrawOverlayUi();
-			ImGui::Render();
-
-			const float ClearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-			gExternalDeviceContext->OMSetRenderTargets(1, &gExternalRenderTargetView, nullptr);
-			gExternalDeviceContext->ClearRenderTargetView(gExternalRenderTargetView, ClearColor);
-			ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-			gExternalSwapChain->Present(0, 0);
-			Sleep(1);
+			LogOverlayStructuredException("external overlay render thread", GetExceptionCode());
+			gRunning = false;
 		}
 	}
 
@@ -8190,6 +9274,13 @@ namespace
 		ImGui::Text("Address: 0x%p", reinterpret_cast<void*>(Actor.Address));
 		if (Actor.HasPlayerState)
 			ImGui::Text("PlayerState: 0x%p", reinterpret_cast<void*>(Actor.PlayerStateAddress));
+		if (Actor.HasLifeState)
+		{
+			ImGui::Text("Life state: %s  health: %.1f",
+				Actor.IsDead ? "dead" : "alive",
+				Actor.HealthValue);
+			ImGui::TextWrapped("Life source: %s", Actor.LifeStateSource.empty() ? "unknown" : Actor.LifeStateSource.c_str());
+		}
 		if (Actor.HasLocation)
 		{
 			ImGui::Text("Location: %.3f, %.3f, %.3f", Actor.Location.X, Actor.Location.Y, Actor.Location.Z);
@@ -8475,6 +9566,7 @@ namespace
 			BoolRow("DrawSkeletons", gConfig.DrawSkeletons);
 			BoolRow("DrawSkeletonBoneIds", gConfig.DrawSkeletonBoneIds);
 			BoolRow("DrawSkeletonBoneNames", gConfig.DrawSkeletonBoneNames);
+			BoolRow("ActorCaptureEnabled", gConfig.ActorCaptureEnabled);
 			BoolRow("UseReflectedPositionFallback", gConfig.UseReflectedPositionFallback);
 			BoolRow("FastOverlayMode", gConfig.FastOverlayMode);
 			BoolRow("ProbeReflectedPositionsOnLocatedActors", gConfig.ProbeReflectedPositionsOnLocatedActors);
@@ -8483,8 +9575,10 @@ namespace
 			BoolRow("OnlyOnScreen", gConfig.OnlyOnScreen);
 			BoolRow("OnlyWithLocation", gConfig.OnlyWithLocation);
 			BoolRow("OnlyInView", gConfig.OnlyInView);
+			BoolRow("ExternalOverlayOnD3D12", gConfig.ExternalOverlayOnD3D12);
 			BoolRow("HideEnvironmentActors", gConfig.HideEnvironmentActors);
 			BoolRow("HideLocalPlayer", gConfig.HideLocalPlayer);
+			BoolRow("HideDeadActors", gConfig.HideDeadActors);
 			BoolRow("LockLikelyPlayerClasses", gConfig.LockLikelyPlayerClasses);
 			BoolRow("EnableDeveloperOptions", gConfig.EnableDeveloperOptions);
 			BoolRow("DeveloperAutoCycleClasses", gConfig.DeveloperAutoCycleClasses);
@@ -8684,8 +9778,25 @@ namespace
 			gConfig.ProjectionScaleY = 1.0f;
 		}
 
-		std::scoped_lock Lock(gConfigMutex);
+		bool bApplyActorCaptureThreadState = false;
+		bool bRequestedActorCaptureState = false;
+
+		std::unique_lock<std::mutex> Lock(gConfigMutex);
 		ImGui::Checkbox("Enabled", &gConfig.Enabled);
+		ImGui::SameLine();
+		if (!gConfig.EnableDeveloperOptions && gConfig.ActorCaptureEnabled)
+		{
+			gConfig.ActorCaptureEnabled = false;
+			bApplyActorCaptureThreadState = true;
+			bRequestedActorCaptureState = false;
+		}
+		ImGui::BeginDisabled(!gConfig.EnableDeveloperOptions);
+		if (ImGui::Checkbox("Actor capture", &gConfig.ActorCaptureEnabled))
+		{
+			bApplyActorCaptureThreadState = true;
+			bRequestedActorCaptureState = gConfig.ActorCaptureEnabled;
+		}
+		ImGui::EndDisabled();
 		ImGui::SameLine();
 		ImGui::Checkbox("Only on screen", &gConfig.OnlyOnScreen);
 		ImGui::SameLine();
@@ -8732,6 +9843,7 @@ namespace
 			ImGui::Checkbox("Probe reflected positions on located actors", &gConfig.ProbeReflectedPositionsOnLocatedActors);
 			ImGui::SliderInt("Reflection refresh ms", &gConfig.ReflectedPositionRefreshMs, 0, 250);
 			ImGui::Combo("Renderer route", &gConfig.RendererRoute, "Auto\0Internal only\0External only\0");
+			ImGui::Checkbox("External overlay for D3D12", &gConfig.ExternalOverlayOnD3D12);
 			ImGui::Combo("Actor source", &gConfig.ActorSource, "Auto\0World levels\0GObjects\0World + GObjects\0");
 			ImGui::Combo("Projection route", &gConfig.ProjectionRoute, "Auto\0Native only\0Fallback only\0");
 			ImGui::Combo("Projection space", &gConfig.ProjectionSpace, "Auto\0Viewport\0Desktop\0");
@@ -8838,6 +9950,10 @@ namespace
 			ImGui::DragFloat("Projection scale X", &gConfig.ProjectionScaleX, 0.001f, 0.10f, 4.0f, "%.3f");
 			ImGui::DragFloat("Projection scale Y", &gConfig.ProjectionScaleY, 0.001f, 0.10f, 4.0f, "%.3f");
 		}
+
+		Lock.unlock();
+		if (bApplyActorCaptureThreadState)
+			ApplyActorCaptureThreadState(bRequestedActorCaptureState, false);
 	}
 
 	void DrawMenu(const std::vector<ActorDebugInfo>& Actors, const std::vector<ActorDebugInfo>& FilteredActors, const CaptureStats& Stats)
@@ -8949,6 +10065,8 @@ namespace
 				ImGui::Checkbox("Bot checker", &gFeatureState.bBotChecker);
 				ImGui::SameLine();
 				ImGui::Checkbox("Bot text", &gFeatureState.bBotCheckerText);
+				ImGui::Checkbox("Hide dead actors", &gConfig.HideDeadActors);
+				ImGui::SameLine();
 				ImGui::Checkbox("Names", &gConfig.DrawNames);
 				gFeatureState.bShowNames = gConfig.DrawNames;
 				ImGui::SameLine();
@@ -8982,6 +10100,12 @@ namespace
 					Stats.FrameProcessedActors,
 					Stats.PositionProbeCacheHits,
 					Stats.PositionProbeCacheMisses);
+				ImGui::Text("Life state: %d known  %d dead  %d hidden  cache %d/%d",
+					Stats.LifeStateActors,
+					Stats.DeadActors,
+					Stats.FilteredDead,
+					Stats.LifeStateProbeCacheHits,
+					Stats.LifeStateProbeCacheMisses);
 				ImGui::Text("Projection route: %s  Native %d/%d  Fallback %d/%d",
 					ProjectionRouteName(GetConfigSnapshot().ProjectionRoute),
 					Stats.NativeProjectionSuccesses,
@@ -9075,6 +10199,10 @@ namespace
 				OverlayConfig ConfigSnapshot = GetConfigSnapshot();
 				ImGui::Text("Captured: %d  Filtered: %d  Filter cache: %d",
 					Stats.CapturedActors, Stats.FilteredActors, static_cast<int>(FilteredActors.size()));
+				ImGui::Text("Life state: %d known  %d dead  %d hidden",
+					Stats.LifeStateActors,
+					Stats.DeadActors,
+					Stats.FilteredDead);
 				{
 					const DWORD Now = GetTickCount();
 					const DWORD LastCapture = Stats.LastCaptureTick;
@@ -9155,6 +10283,8 @@ namespace
 					ImGui::Checkbox("Hide vehicles", &gConfig.HideVehicles);
 					ImGui::SameLine();
 					ImGui::Checkbox("Hide objectives", &gConfig.HideObjectives);
+					ImGui::SameLine();
+					ImGui::Checkbox("Hide dead", &gConfig.HideDeadActors);
 					if (ImGui::Button("Reset actor classifier tokens"))
 					{
 						std::snprintf(gConfig.BotFilter, sizeof(gConfig.BotFilter), "%s", DefaultBotTokens());
@@ -9785,6 +10915,7 @@ namespace DebugOverlay
 
 		{
 			std::scoped_lock Lock(gConfigMutex);
+			gConfig.ActorCaptureEnabled = gConfig.ActorCaptureEnabled && gConfig.EnableDeveloperOptions;
 			gConfig.CaptureOnRenderFrame = false;
 			gConfig.FastOverlayMode = true;
 			gConfig.ProbeReflectedPositionsOnLocatedActors = false;
@@ -9806,28 +10937,36 @@ namespace DebugOverlay
 			EnsureRuntimeTokenDefaults(gConfig);
 			gConfig.DrawSkeletonBoneIds = false;
 			gConfig.DrawSkeletonBoneNames = false;
-			gConfig.FrameProjectionMaxActors = std::min(gConfig.FrameProjectionMaxActors, 64);
+			gConfig.FrameCaptureMinMs = std::clamp(gConfig.FrameCaptureMinMs, 8, 16);
+			gConfig.FrameProjectionMaxActors = std::clamp(std::max(gConfig.FrameProjectionMaxActors, 128), 128, 256);
 			gConfig.FrameSkeletonMinMs = std::max(gConfig.FrameSkeletonMinMs, 1000);
-			gConfig.ReflectedPositionRefreshMs = std::max(gConfig.ReflectedPositionRefreshMs, 1000);
+			gConfig.ReflectedPositionRefreshMs = std::clamp(gConfig.ReflectedPositionRefreshMs, 0, 250);
 			gConfig.RefreshMs = std::max(gConfig.RefreshMs, 1000);
-			gConfig.MaxActors = std::min(gConfig.MaxActors, 256);
+			gConfig.MaxActors = std::clamp(std::max(gConfig.MaxActors, 256), 256, 512);
 			gConfig.MaxBoxScreenFraction = std::min(gConfig.MaxBoxScreenFraction, 0.40f);
 		}
 		ClearLikelyClassLock();
 		std::cerr << "[Overlay] Render path is cache-only\n";
+		if (!GetConfigSnapshot().ActorCaptureEnabled)
+			std::cerr << "[Overlay] Actor capture disabled for stability. Enable Developer Options and ActorCaptureEnabled to test it.\n";
 
 		gBackend = WaitForRendererBackend();
 
 		bool bHooked = false;
 		const OverlayConfig Config = GetConfigSnapshot();
-		const bool bStreamlineNeedsExternal = gBackend == RenderBackend::D3D12
-			&& Config.ExternalOverlayOnStreamline
-			&& HasStreamlineOrFrameGenModule();
+		const bool bD3D12NeedsExternal = gBackend == RenderBackend::D3D12
+			&& (Config.ExternalOverlayOnD3D12
+				|| (Config.ExternalOverlayOnStreamline && HasStreamlineOrFrameGenModule()));
 		const bool bUseExternalOverlay = Config.RendererRoute == 2
-			|| (Config.RendererRoute == 0 && bStreamlineNeedsExternal);
+			|| (Config.RendererRoute == 0 && bD3D12NeedsExternal);
 
 		if (bUseExternalOverlay)
 		{
+			if (gBackend == RenderBackend::D3D12)
+			{
+				std::cerr << "[Overlay] D3D12 detected; using external overlay to avoid command queue hooks\n";
+				SetStatus("D3D12 detected, using external overlay");
+			}
 			gRunning = true;
 			bHooked = StartExternalOverlay();
 		}
@@ -9858,9 +10997,15 @@ namespace DebugOverlay
 		}
 
 		gRunning = true;
-		gCaptureThread = std::thread(CaptureThreadProc);
-		std::cerr << "[Overlay] Background capture started\n";
-		SetStatus(std::string("Render backend detected: ") + BackendName(gBackend) + (gExternalOverlay ? " (external overlay)" : " (internal overlay)"));
+		if (GetConfigSnapshot().ActorCaptureEnabled)
+		{
+			ApplyActorCaptureThreadState(true, false);
+			SetStatus(std::string("Render backend detected: ") + BackendName(gBackend) + (gExternalOverlay ? " (external overlay)" : " (internal overlay)"));
+		}
+		else
+		{
+			SetStatus("Actor capture disabled for stability");
+		}
 		return true;
 	}
 
@@ -9871,9 +11016,8 @@ namespace DebugOverlay
 
 		gShutdownRequested = true;
 		gRunning = false;
-
-		if (gCaptureThread.joinable())
-			gCaptureThread.join();
+		gCaptureThreadRequested.store(false);
+		ApplyActorCaptureThreadState(false, true);
 
 		if (gExternalRenderThread.joinable())
 			gExternalRenderThread.join();
@@ -9903,6 +11047,10 @@ namespace DebugOverlay
 		{
 			std::scoped_lock CacheLock(gPositionProbeCacheMutex);
 			gPositionProbeCache.clear();
+		}
+		{
+			std::scoped_lock CacheLock(gLifeStateProbeCacheMutex);
+			gLifeStateProbeCache.clear();
 		}
 		{
 			std::scoped_lock CacheLock(gMeshProbeCacheMutex);
